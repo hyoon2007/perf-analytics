@@ -1,0 +1,7 @@
+pandas
+numpy
+xgboost
+shap
+requests
+boto3
+watchdog

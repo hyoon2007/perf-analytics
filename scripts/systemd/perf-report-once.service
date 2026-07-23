@@ -1,0 +1,13 @@
+[Unit]
+Description=Perf Analytics One-shot Report Runner
+After=network.target
+
+[Service]
+Type=oneshot
+User=analyst
+WorkingDirectory=/opt/perf-analytics
+Environment=PYTHONPATH=/opt/perf-analytics/scripts
+ExecStart=/opt/perf-analytics/venv/bin/python /opt/perf-analytics/scripts/run_timerweight_report.py --input-file %i --source local --config /opt/perf-analytics/config/ops_pipeline.conf
+
+[Install]
+WantedBy=multi-user.target

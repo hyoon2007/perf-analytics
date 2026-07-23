@@ -1,0 +1,15 @@
+[Unit]
+Description=Perf Analytics FTP Polling Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=analyst
+WorkingDirectory=/opt/perf-analytics
+Environment=PYTHONPATH=/opt/perf-analytics/scripts
+ExecStart=/opt/perf-analytics/venv/bin/python /opt/perf-analytics/scripts/watch_incoming.py --config /opt/perf-analytics/config/ops_pipeline.conf --interval 300
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
