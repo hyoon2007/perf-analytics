@@ -15,5 +15,4 @@ failed/
 reports/
 data/
 config/*.conf
-notebooks/*.ipynb
 notebooks/report_preview*.html
