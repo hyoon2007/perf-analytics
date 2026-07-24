@@ -380,12 +380,22 @@ def composite_verdict_flags(focus, within_floor_ms=80):
 # ============================ v4 additions ============================
 def select_focus_segments(primary_movers, overall_win, dim,
                           min_share_pp=1.0, min_p75_delta=80,
-                          min_anom_share=1.5, max_focus=3):
+                          min_anom_share=1.5, max_focus=3,
+                          min_contribution_ratio=0.15, min_contribution_abs=15.0):
     """v4: return a LIST of problem segments, not one. A segment qualifies if
     EITHER (a) it is slower-than-site AND gained meaningful traffic share, OR
     (b) its own p75 degraded materially while carrying non-trivial traffic.
     Ranked by contribution to the sitewide p75 rise; capped at max_focus with
-    the remainder summarized. Fully generic — no segment names referenced."""
+    the remainder summarized. Fully generic — no segment names referenced.
+
+    v6.9.1 materiality gate: a segment is only kept as a headline focus when its
+    contribution to the SITEWIDE p75 rise is material. The lead segment is always
+    kept; each further segment must contribute at least `min_contribution_ratio`
+    of the lead's contribution AND at least `min_contribution_abs`. This stops a
+    tiny segment with a large *internal* p75 jump but negligible sitewide impact
+    (e.g. a 2% section that even lost traffic) from being co-headlined next to the
+    real driver with no explanation. Sub-threshold segments are summarized under
+    additional_segments instead of dropped."""
     share = {r["segment"]: r for r in primary_movers["share_movers"]}
     perf = {r["segment"]: r for r in primary_movers["perf_movers"]}
     universe = {**perf, **share}     # union of both mover views
@@ -404,9 +414,22 @@ def select_focus_segments(primary_movers, overall_win, dim,
                            "self_regressed": bool(self_regressed),
                            "contribution_score": round(float(contrib), 1)}
     ranked = sorted(picked.values(), key=lambda x: -x["contribution_score"])
-    return {"focus_list": ranked[:max_focus],
-            "additional_count": max(0, len(ranked) - max_focus),
-            "additional_segments": [r["segment"] for r in ranked[max_focus:]],
+
+    # materiality gate: keep the lead; a further segment must clear both a
+    # relative (fraction of the lead) and an absolute contribution floor.
+    material = []
+    if ranked:
+        lead_score = ranked[0]["contribution_score"]
+        floor = max(min_contribution_abs, min_contribution_ratio * lead_score)
+        material = [ranked[0]] + [r for r in ranked[1:] if r["contribution_score"] >= floor]
+    material_segs = {r["segment"] for r in material}
+    immaterial = [r["segment"] for r in ranked if r["segment"] not in material_segs]
+
+    focus_list = material[:max_focus]
+    additional_segments = [r["segment"] for r in material[max_focus:]] + immaterial
+    return {"focus_list": focus_list,
+            "additional_count": len(additional_segments),
+            "additional_segments": additional_segments,
             "total_qualified": len(ranked)}
 
 
@@ -1508,19 +1531,61 @@ def build_narrative_facts(findings):
             f"composition and {fmt_ms(d.get('within_effect_ms', 0))} from sections "
             f"becoming slower in their own right.")
 
+    # v6.9.1 FIX: only assert a "new-visitor" audience shift when the
+    # new_visitor_influx signal actually fired. Previously this sentence was
+    # emitted unconditionally and hardcoded "more first-time visitors", so on
+    # windows where session-entry share FELL (and the flag was False) the report
+    # still claimed more first-time visitors — contradicting its own numbers.
     b = findings.get("behavior") or {}
     n, a = b.get("normal") or {}, b.get("anomaly") or {}
     if n.get("landing_share_pct") is not None and a.get("landing_share_pct") is not None:
-        cache_note = ""
-        if n.get("client_cacherate_median") is not None:
-            # the cache figure is an index, not a duration — never suffix it with ms
-            cache_note = (f", and the median browser cache hit rate from "
-                          f"{fmt_num(n['client_cacherate_median'])} to "
-                          f"{fmt_num(a.get('client_cacherate_median', 0))}")
-        facts["audience"] = (
-            f"Session-entry page views moved from {fmt_pct(n['landing_share_pct'])} to "
-            f"{fmt_pct(a['landing_share_pct'])}{cache_note} — indicators of more "
-            f"first-time visitors, not causes of the slowdown.")
+        if b.get("new_visitor_influx"):
+            cache_note = ""
+            if n.get("client_cacherate_median") is not None:
+                # the cache figure is an index, not a duration — never suffix it with ms
+                cache_note = (f", and the median browser cache hit rate from "
+                              f"{fmt_num(n['client_cacherate_median'])} to "
+                              f"{fmt_num(a.get('client_cacherate_median', 0))}")
+            facts["audience"] = (
+                f"Session-entry page views moved from {fmt_pct(n['landing_share_pct'])} to "
+                f"{fmt_pct(a['landing_share_pct'])}{cache_note}, an indicator of more "
+                f"first-time visitors, not a cause of the slowdown.")
+        else:
+            # signal did not fire → state plainly that audience mix is not a factor
+            facts["audience_stable"] = (
+                "Audience-mix signals (session-entry share and browser cache rate) were "
+                "essentially unchanged between the windows, so audience composition is "
+                "not a factor in this change.")
+
+    # v6.9.1 improvement: absolute-severity context. The delta can be small while
+    # the baseline is already catastrophic (e.g. TBT p75 far past the 'poor' band).
+    # Number-free so it never trips the numeric validators.
+    meta = findings.get("meta") or {}
+    hl = findings.get("headline") or {}
+    metric_name = meta.get("metric")
+    r_norm, r_anom = hl.get("rating_normal"), hl.get("rating_anomaly")
+    if metric_name and r_anom == "poor":
+        if r_norm == "poor":
+            facts["severity_context"] = (
+                f"Both windows already rate 'poor' for {metric_name}, so its level is a "
+                f"chronic baseline issue well above the acceptable range — this window's "
+                f"change sits on top of an already-poor baseline.")
+        else:
+            facts["severity_context"] = (
+                f"{metric_name} crossed into the 'poor' range in the anomaly window, "
+                f"pushing it past the acceptable threshold rather than staying healthy.")
+
+    # v6.9.1 improvement: for main-thread metrics with a genuine self-regression
+    # and clean delivery, point responsibility client-side (JS / third-party tags)
+    # so the reader is not left looking at the network. Number-free.
+    prof = meta.get("profile")
+    within = (findings.get("within_regression") or {}).get("within_regression")
+    deliv = (findings.get("delivery") or {}).get("verdict")
+    if prof == "tbt" and within and deliv == "clean":
+        facts["client_side"] = (
+            "With CDN and origin delivery clean, the added blocking time originates "
+            "client-side — main-thread JavaScript and third-party tags on the affected "
+            "section — rather than in network delivery.")
 
     for r in (findings.get("segments", {}).get("focus_list") or []):
         facts[f"section::{r['segment']}"] = (
@@ -1646,18 +1711,22 @@ def build_section_facts(findings):
     verdict_sentence = (findings.get("verdict") or {}).get("sentence")
     if verdict_sentence:
         sec["Executive Summary"].append(verdict_sentence)
+    if "severity_context" in flat:
+        sec["Executive Summary"].append(flat["severity_context"])
     if "impact" in flat:
         sec["Executive Summary"].append(flat["impact"])
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
-    for key in ("decomposition", "audience", "coverage"):
+    for key in ("decomposition", "audience", "client_side", "coverage"):
         if key in flat:
             sec["What Changed"].append(flat[key])
 
     if "monitoring" in flat:
         sec["Monitoring Notes"] = [flat["monitoring"]]
 
+    if "audience_stable" in flat:
+        sec["What Did Not Change"].append(flat["audience_stable"])
     delivery = findings.get("delivery") or {}
     if delivery.get("verdict") == "clean":
         sec["What Did Not Change"].append(
