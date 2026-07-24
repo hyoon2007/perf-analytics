@@ -7,6 +7,7 @@ Type=simple
 User=analyst
 WorkingDirectory=/opt/perf-analytics
 Environment=PYTHONPATH=/opt/perf-analytics/scripts
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/perf-analytics/venv/bin/python /opt/perf-analytics/scripts/watch_incoming.py --config /opt/perf-analytics/config/ops_pipeline.conf --interval 300
 Restart=always
 RestartSec=10
