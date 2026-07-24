@@ -1,9 +1,10 @@
 # v6 리포트 판정 로직 (Verdict & Recommended Actions)
 
-이 문서는 v6 파이프라인(`pipeline.py`)이 이상 리포트에서 **판정(verdict)**과
-**권장 조치(Recommended Actions)**를 **어떻게 자동으로 선택**하는지 설명합니다.
-두 가지 모두 LLM이 지어내는 것이 아니라 **결정론적 규칙**으로 정해지며, LLM은
-정해진 내용을 고객용 문장으로 다듬기만 합니다.
+이 문서는 v6 파이프라인(`pipeline.py`)이 이상 리포트를 **어떻게 자동으로 구성**하는지
+설명합니다: **판정(verdict, §1–4)**, **권장 조치(Recommended Actions, §5–6)**,
+**문제 섹션(focus) 선정과 materiality 게이트(§7)**, **서술 문장 생성·스코프 규칙(§8)**.
+이 모두는 LLM이 지어내는 것이 아니라 **결정론적 규칙**으로 정해지며, LLM은 정해진
+내용을 고객용 문장으로 다듬기만 합니다.
 
 ## 1. 큰 그림 — 숫자가 오르는 이유는 2가지
 
@@ -125,3 +126,66 @@ findings가 `delivery = degraded`, `within_regression = true`, metric = lcp였�
 코드 변경 없이 **`playbook.py`의 `AKAMAI_PLAYBOOK` 리스트에 항목 하나를 추가**하면
 됩니다(조건 predicate + action 문장 + levers + scope_tag). 매칭·검증·폴백이 모두
 데이터 기반이라 자동으로 반영됩니다.
+
+## 7. Focus 섹션 선정과 materiality 게이트
+
+판정과 리포트 본문은 **어느 페이지 섹션(page_group)이 변화를 일으켰나**에서
+출발합니다. `top_movers()`가 트래픽 비중·내부 p75가 가장 많이 움직인 후보를
+발굴하고, `select_focus_segments()`가 그중 **문제 섹션(focus)**을 고릅니다.
+
+**자격 조건** (둘 중 하나면 후보):
+- `gained_share`: 사이트보다 느린 섹션이 트래픽 비중을 의미 있게 늘림, 또는
+- `self_regressed`: 내부 p75가 기준 이상 악화 + 비중이 사소하지 않음(≥1.5%).
+
+후보는 **기여도 점수(contribution_score)**로 정렬됩니다 —
+`(비중증가/100)×정상p75 + (이상비중/100)×p75악화분` — 즉 사이트 전체 p75 상승에
+얼마나 기여했는지의 근사치입니다.
+
+**materiality 게이트** (v6.9.1): 1위 섹션은 항상 유지하고, **2위 이하는**
+`min_contribution_ratio`(기본 0.15, 1위 대비 비율)와 `min_contribution_abs`(기본
+15.0, 절대값)를 **둘 다** 넘어야 헤드라인 focus로 남습니다. 미달 섹션은 버리지 않고
+`additional_segments`(요약)로 강등합니다.
+
+> **왜 필요한가**: 트래픽 2%짜리 섹션이 **내부적으로만** 크게 튀어도 사이트 전체
+> 기여는 미미할 수 있습니다. 예) `smartphones` 기여 219 vs `unpacked` 기여 8.6(142ms
+> 중 ~8.6ms). 게이트가 없으면 `unpacked`가 주범 옆에 **이유 없이 나란히** 헤드라인에
+> 올라 혼동을 줍니다. 게이트가 이를 요약 항목으로 강등합니다.
+
+focus 개수는 그대로 판정(`multi` 여부)에 반영됩니다(§3 참조).
+
+## 8. 서술 문장(narrative facts) 생성과 스코프 규칙
+
+리포트의 **모든 핵심 문장은 파이썬이 미리 작성**하고(`build_narrative_facts` /
+`build_section_facts`) LLM은 그것을 각 섹션에 배치·재서술만 합니다. 목적은 LLM이
+큰 JSON에서 숫자를 잘못 집어오는 것을 막는 것입니다.
+
+### behavior(방문자) 신호 — 스코프와 게이트
+- **스코프 = focus 섹션**: 방문자 신호는 사이트 전체가 아니라 **문제 섹션 내부**에서
+  계산됩니다(`behavior_signals(focus_df)`). 그래서 섹션의 cache 중앙값(예 1,676)은
+  사이트 전체 중앙값(예 3,076)과 **다릅니다**. 문장은 이를 혼동하지 않도록
+  *"Within the '<섹션>' page section, …"*으로 **스코프를 명시**합니다(초점이 없어
+  `scope=overall`이면 접두 없이 사이트 전체값).
+- **new_visitor_influx 게이트**: *"more first-time visitors"* 서술은 신호가 실제로
+  발화했을 때만 나갑니다. 발화 조건 = 다음 3개 중 **2개 이상**: 진입(landing) 비중
+  +2pp 이상, referrer 비중 −2pp 이상, cache 중앙값이 정상의 0.8배 미만. 미발화 시엔
+  숫자 없이 *"audience composition is not a factor"*를 **What Did Not Change**에 둡니다.
+
+> 두 규칙 모두 v6.9.1 수정입니다. 이전에는 이 문장이 **무조건** 생성되고 방향과
+> 무관하게 "more first-time visitors"를 단정해, 진입 비중이 오히려 **줄어든** 창에서도
+> 신규 방문자 증가를 주장하는 버그가 있었습니다.
+
+### 절대 심각도 배지 (v6.9.1)
+delta가 작아도 baseline 자체가 재앙일 수 있습니다(예 TBT p75 ~2,400ms는 'poor'
+기준 600ms의 수 배). 메트릭 프로파일의 등급(good / needs-improvement / poor)을 읽어,
+이상 창이 'poor'면 **"chronic baseline issue"** 문장을 Executive Summary에 추가합니다.
+숫자를 넣지 않아 번호 검증기를 건드리지 않습니다.
+
+### client-side 원인 귀속 (v6.9.1)
+메인스레드 계열 메트릭(현재 `tbt`)에서 **자체 저하 + 배달(delivery) clean**이면,
+추가 blocking이 네트워크가 아니라 **client-side(메인스레드 JS·서드파티 태그)**에서
+온다는 문장을 추가합니다. 독자가 배달 구간을 헛짚지 않도록 방향을 잡아줍니다.
+
+### 번호 검증과의 관계
+위 문장 중 숫자를 담는 것(headline·decomposition·audience 등)의 값은 findings에서
+그대로 온 화이트리스트 숫자이며, 새로 추가한 심각도·client-side 문장은 **number-free**라
+검증·critic·바인딩 체크를 통과합니다.
