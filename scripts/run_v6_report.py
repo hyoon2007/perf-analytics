@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Runner for the v6 anomaly-report pipeline.
+
+Mirrors run_timerweight_report.py (the v1 runner) so the FTP monitor can invoke
+both against the SAME downloaded CSV during the parallel-comparison period.
+
+File lifecycle: by default the runner moves the CSV to processed/ (or failed/)
+when run standalone. Pass --no-move so the caller (the monitor) owns the move
+after BOTH pipelines have run — this keeps v1 and v6 reading the same file.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,18 +18,17 @@ from pathlib import Path
 
 from perf_analytics.config_utils import load_app_config, load_email_credentials, resolve_input_path
 from perf_analytics.emailer import send_email
-from perf_analytics.llm_gateway import GatewayConfig, GatewayClient
-from perf_analytics.pipeline import fetch_csv_from_ftp, md_to_simple_html, run_pipeline
+from perf_analytics.pipeline import fetch_csv_from_ftp
+from perf_analytics_v6.pipeline import run_v6
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run timer-weight anomaly report pipeline.")
+    parser = argparse.ArgumentParser(description="Run the v6 anomaly report pipeline.")
     parser.add_argument("--input-file", required=True, help="Input CSV file name or path.")
     parser.add_argument("--source", choices=["local", "ftp"], default="local", help="Input source type.")
     parser.add_argument("--config", default="/opt/perf-analytics/config/ops_pipeline.conf", help="Path to ops config file.")
     parser.add_argument("--sec-dir", default=None, help="Secrets dir (default: <base_data_dir>/.sec).")
-    parser.add_argument("--subject-prefix", default="[v1] ", help="Email subject prefix tag.")
-    parser.add_argument("--skip-llm", action="store_true", help="Skip LLM report generation.")
+    parser.add_argument("--subject-prefix", default="[v6] ", help="Email subject prefix tag.")
     parser.add_argument("--skip-email", action="store_true", help="Skip SES email send.")
     parser.add_argument("--no-move", action="store_true", help="Do not move the CSV after processing (caller owns it).")
     return parser.parse_args()
@@ -30,7 +38,6 @@ def main() -> int:
     args = parse_args()
     cfg = load_app_config(args.config)
     sec_dir = Path(args.sec_dir) if args.sec_dir else (cfg.data_dir / ".sec")
-    llm_client = GatewayClient(GatewayConfig.load(sec_dir / "inference-gateway"))
 
     if args.source == "ftp":
         local_csv = cfg.incoming_dir / Path(args.input_file).name
@@ -49,25 +56,25 @@ def main() -> int:
         print(f"[ERROR] Input file not found: {csv_path}")
         return 2
 
-    print(f"[INFO] Processing file: {csv_path}")
+    print(f"[INFO][v6] Processing file: {csv_path}")
 
     result = None
     pipeline_error = None
     for attempt in range(1, cfg.pipeline_max_retries + 1):
         try:
-            result = run_pipeline(
+            result = run_v6(
                 csv_path=csv_path,
-                llm_client=llm_client,
-                min_onehot_on_ratio=cfg.min_onehot_on_ratio,
-                use_llm=not args.skip_llm,
+                sec_dir=sec_dir,
+                processed_dir=cfg.processed_dir,
+                subject_prefix=args.subject_prefix,
             )
             break
         except Exception as exc:
             pipeline_error = exc
             if attempt < cfg.pipeline_max_retries:
                 wait_s = cfg.pipeline_backoff_seconds * attempt
-                print(f"[WARN] Pipeline attempt {attempt} failed: {exc}")
-                print(f"[INFO] Retrying in {wait_s}s...")
+                print(f"[WARN][v6] Pipeline attempt {attempt} failed: {exc}")
+                print(f"[INFO][v6] Retrying in {wait_s}s...")
                 time.sleep(wait_s)
 
     if result is None:
@@ -75,32 +82,15 @@ def main() -> int:
             target = cfg.failed_dir / csv_path.name
             if csv_path.exists():
                 shutil.move(str(csv_path), str(target))
-                print(f"[INFO] Moved file to failed: {target}")
-        print(f"[ERROR] Pipeline failed after retries: {pipeline_error}")
+                print(f"[INFO][v6] Moved file to failed: {target}")
+        print(f"[ERROR][v6] Pipeline failed after retries: {pipeline_error}")
         return 1
 
-    print("[INFO] Top direction-matched features")
-    print(result.selected_features[["feature", "importance", "effect_for_ranking", "impact_type"]].head(10).to_string(index=False))
+    print(f"[INFO][v6] verdict={result['verdict_code']} severity={result['severity']} "
+          f"source={result['report_source']}")
 
     if not args.skip_email:
         email_cfg = load_email_credentials(cfg)
-        subject = f"{args.subject_prefix}[Alert Report] {result.timer_metric_name} | {result.timer_transition_label}"
-        body_text = "\n".join(
-            [
-                "## Timer Change Summary",
-                "",
-                result.timer_change_summary,
-                "",
-                "## AI Analysis",
-                "",
-                result.analysis_report,
-                "",
-                "### Selected Top5 Exclusion Reason",
-                "",
-                result.top5_coverage_note,
-            ]
-        )
-        body_html = md_to_simple_html(body_text)
         email_error = None
         message_id = None
         for attempt in range(1, cfg.email_max_retries + 1):
@@ -111,31 +101,31 @@ def main() -> int:
                     ses_region=email_cfg["ses_region"],
                     from_email=email_cfg["ses_from_email"],
                     to_email=email_cfg["ses_to_email"],
-                    subject=subject,
-                    text_body=body_text,
-                    html_body=body_html,
+                    subject=result["email_subject"],
+                    text_body=result["email_plain"],
+                    html_body=result["email_html"],
                 )
                 break
             except Exception as exc:
                 email_error = exc
                 if attempt < cfg.email_max_retries:
                     wait_s = cfg.email_backoff_seconds * attempt
-                    print(f"[WARN] Email attempt {attempt} failed: {exc}")
-                    print(f"[INFO] Retrying email in {wait_s}s...")
+                    print(f"[WARN][v6] Email attempt {attempt} failed: {exc}")
+                    print(f"[INFO][v6] Retrying email in {wait_s}s...")
                     time.sleep(wait_s)
 
         if message_id:
-            print(f"[INFO] Email sent. MessageId: {message_id}")
+            print(f"[INFO][v6] Email sent. MessageId: {message_id}")
         else:
-            print(f"[ERROR] Email failed after retries: {email_error}")
+            print(f"[ERROR][v6] Email failed after retries: {email_error}")
 
     if not args.no_move:
         target = cfg.processed_dir / csv_path.name
         if csv_path.exists() and csv_path.resolve() != target.resolve():
             shutil.move(str(csv_path), str(target))
-        print(f"[INFO] Completed. Processed file moved to: {target}")
+        print(f"[INFO][v6] Completed. Processed file moved to: {target}")
     else:
-        print("[INFO] Completed (file left in place; caller owns move).")
+        print("[INFO][v6] Completed (file left in place; caller owns move).")
     return 0
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from ftplib import FTP
@@ -9,7 +8,6 @@ from typing import Tuple, TypedDict
 
 import numpy as np
 import pandas as pd
-import requests
 import shap
 import xgboost as xgb
 
@@ -434,26 +432,26 @@ def _enforce_executive_summary_ground_truth(report_text: str, ground_truth_line:
     return "\n".join(lines)
 
 
-def _generate_report_with_ollama(prompt: str, ollama_url: str, model: str) -> str:
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def _strip_think(text: str) -> str:
+    """qwen3-14b-awq emits <think>...</think> reasoning because the gateway
+    rejects chat_template_kwargs (enable_thinking cannot be turned off
+    server-side). Remove the block and any stray tags before using the text."""
+    text = _THINK_RE.sub("", text)
+    text = re.sub(r"</?think>", "", text)
+    return text.strip()
+
+
+def _generate_report_with_gateway(prompt: str, llm_client) -> str:
+    """Generate the analysis via the shared inference-gateway client
+    (qwen3-14b-awq). Mirrors the v6 path so both pipelines use one LLM."""
     try:
-        response = requests.post(
-            ollama_url,
-            json={"model": model, "prompt": prompt, "stream": True, "options": {"temperature": 0}},
-            stream=True,
-            timeout=300,
-        )
-        response.raise_for_status()
+        raw = llm_client.chat(prompt)
     except Exception as exc:
         return f"LLM report generation failed: {exc}"
-
-    chunks = []
-    for line in response.iter_lines():
-        if not line:
-            continue
-        data = json.loads(line)
-        if "response" in data:
-            chunks.append(data["response"])
-    return "".join(chunks).strip()
+    return _strip_think(raw)
 
 
 def _fallback_report(selected_features: pd.DataFrame, anomaly_direction: str, summary: str) -> str:
@@ -493,8 +491,7 @@ def md_to_simple_html(text: str) -> str:
 
 def run_pipeline(
     csv_path: Path,
-    ollama_url: str,
-    ollama_model: str,
+    llm_client,
     min_onehot_on_ratio: float,
     use_llm: bool = True,
 ) -> PipelineResult:
@@ -586,7 +583,7 @@ def run_pipeline(
     )
 
     if use_llm:
-        analysis_report = _generate_report_with_ollama(prompt, ollama_url, ollama_model)
+        analysis_report = _generate_report_with_gateway(prompt, llm_client)
         if analysis_report.strip():
             analysis_report = _enforce_executive_summary_ground_truth(
                 analysis_report,

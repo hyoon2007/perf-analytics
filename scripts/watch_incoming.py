@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""FTP-polling monitor.
+"""FTP-polling monitor (parallel v6 + v1 comparison mode).
 
-Polls the remote FTP server every --interval seconds.
-When a new .csv file is detected, calls the pipeline runner with --source ftp
-so the runner downloads the file itself.
+Polls the remote FTP server every --interval seconds. When a new .csv appears:
+  1. the MONITOR downloads it ONCE into incoming/ (so both pipelines read the
+     exact same file — an apples-to-apples comparison);
+  2. it runs the v6 runner FIRST (the pipeline we are moving to), then the v1
+     runner, each as a SEPARATE subprocess with --no-move;
+  3. it moves the file to processed/ if v6 succeeded, else to failed/.
 
-Downloaded files are staged in incoming/, processed to processed/,
-or moved to failed/ on error. incoming/ acts as an audit trail;
-set keep_incoming=false in [ftp] config to delete after processing instead.
+Crash isolation: each runner is its own process, so if v1 dies in SHAP
+(OOM/segfault on large data) the monitor and the already-finished v6 run are
+unaffected. v1 is best-effort — its exit code never blocks the file lifecycle.
+Running the two sequentially (not concurrently) also avoids a combined
+memory spike taking down the v6 run.
+
+incoming/ is only a transient staging area here; the monitor always moves the
+file out to processed/ or failed/ once both runners return.
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 import time
@@ -19,9 +28,13 @@ from ftplib import FTP, all_errors as FTP_ERRORS
 from pathlib import Path
 
 from perf_analytics.config_utils import load_app_config, AppConfig
+from perf_analytics.pipeline import fetch_csv_from_ftp
 
 
 VALID_EXTS = (".csv",)
+SCRIPT_DIR = Path(__file__).resolve().parent
+V6_RUNNER = SCRIPT_DIR / "run_v6_report.py"
+V1_RUNNER = SCRIPT_DIR / "run_timerweight_report.py"
 
 
 def _list_ftp_files(cfg: AppConfig) -> set[str]:
@@ -38,43 +51,68 @@ def _list_ftp_files(cfg: AppConfig) -> set[str]:
         return set()
 
 
-def _run_pipeline(
-    filename: str,
-    runner_script: Path,
-    cfg_path: str,
-    max_retries: int,
-    backoff_seconds: int,
-    extra_args: list[str],
-) -> None:
+def _run_runner(runner_script: Path, filename: str, cfg_path: str, label: str,
+                extra_args: list[str]) -> int:
+    """Run one pipeline runner against the staged local file. Never raises;
+    returns the subprocess exit code (or 1 on launch failure)."""
     cmd = [
-        sys.executable,
-        str(runner_script),
+        sys.executable, str(runner_script),
         "--input-file", filename,
-        "--source", "ftp",
+        "--source", "local",
         "--config", cfg_path,
+        "--no-move",
     ] + extra_args
-
-    print(f"[MONITOR] New FTP file detected: {filename}")
-    for attempt in range(1, max_retries + 1):
+    print(f"[MONITOR] -> {label}: {' '.join(cmd)}")
+    try:
         result = subprocess.run(cmd, check=False)
-        print(f"[MONITOR] Attempt {attempt}/{max_retries} exit={result.returncode} for {filename}")
-        if result.returncode == 0:
-            return
-        if attempt < max_retries:
-            wait_s = backoff_seconds * attempt
-            print(f"[MONITOR] Retry in {wait_s}s...")
-            time.sleep(wait_s)
-    print(f"[MONITOR] All retries exhausted for {filename}")
+        print(f"[MONITOR] <- {label} exit={result.returncode} for {filename}")
+        return result.returncode
+    except Exception as exc:  # never let one runner take down the monitor
+        print(f"[MONITOR] {label} launch failed for {filename}: {exc}")
+        return 1
+
+
+def _process_new_file(filename: str, cfg: AppConfig, cfg_path: str,
+                      extra_args: list[str]) -> None:
+    print(f"[MONITOR] New FTP file detected: {filename}")
+
+    # 1) download ONCE into incoming/
+    local_target = cfg.incoming_dir / Path(filename).name
+    try:
+        fetch_csv_from_ftp(
+            filename=Path(filename).name,
+            ftp_host=cfg.ftp_host,
+            ftp_user=cfg.ftp_user,
+            ftp_password=cfg.ftp_password,
+            ftp_remote_dir=cfg.ftp_remote_dir,
+            local_target=local_target,
+        )
+    except Exception as exc:
+        print(f"[MONITOR] Download failed for {filename}: {exc}")
+        return
+
+    name = local_target.name
+
+    # 2) v6 first (the pipeline we are moving to), then v1 (best-effort)
+    v6_rc = _run_runner(V6_RUNNER, name, cfg_path, "v6", extra_args)
+    v1_rc = _run_runner(V1_RUNNER, name, cfg_path, "v1", extra_args)
+    if v1_rc != 0:
+        print(f"[MONITOR] v1 returned {v1_rc} (best-effort; not blocking) for {name}")
+
+    # 3) file lifecycle keyed on v6 outcome
+    dest_dir = cfg.processed_dir if v6_rc == 0 else cfg.failed_dir
+    target = dest_dir / name
+    if local_target.exists() and local_target.resolve() != target.resolve():
+        shutil.move(str(local_target), str(target))
+    print(f"[MONITOR] Moved {name} to {'processed' if v6_rc == 0 else 'failed'}: {target}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Poll FTP server every --interval seconds and run pipeline on new CSV files."
+        description="Poll FTP every --interval seconds; run v6 + v1 on each new CSV."
     )
     parser.add_argument("--config", default="/opt/perf-analytics/config/ops_pipeline.conf")
     parser.add_argument("--interval", type=int, default=300, help="FTP poll interval in seconds (default: 300).")
-    parser.add_argument("--runner-max-retries", type=int, default=3)
-    parser.add_argument("--runner-backoff-seconds", type=int, default=30)
     parser.add_argument("--skip-llm", action="store_true")
     parser.add_argument("--skip-email", action="store_true")
     return parser.parse_args()
@@ -83,7 +121,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cfg = load_app_config(args.config)
-    runner_script = Path(__file__).resolve().parent / "run_timerweight_report.py"
 
     extra_args: list[str] = []
     if args.skip_llm:
@@ -93,8 +130,9 @@ def main() -> int:
 
     print(f"[MONITOR] FTP host  : {cfg.ftp_host}/{cfg.ftp_remote_dir}")
     print(f"[MONITOR] Poll every: {args.interval}s")
+    print(f"[MONITOR] Runners   : v6={V6_RUNNER.name}, v1={V1_RUNNER.name} (v6 first, v1 best-effort)")
 
-    # Seed initial snapshot so we don't re-process files already on server.
+    # Seed initial snapshot so we don't re-process files already on the server.
     seen: set[str] = _list_ftp_files(cfg)
     print(f"[MONITOR] Baseline snapshot: {len(seen)} file(s) on FTP (will not reprocess).")
 
@@ -103,14 +141,7 @@ def main() -> int:
         current = _list_ftp_files(cfg)
         new_files = current - seen
         for filename in sorted(new_files):
-            _run_pipeline(
-                filename=filename,
-                runner_script=runner_script,
-                cfg_path=args.config,
-                max_retries=args.runner_max_retries,
-                backoff_seconds=args.runner_backoff_seconds,
-                extra_args=extra_args,
-            )
+            _process_new_file(filename, cfg, args.config, extra_args)
             seen.add(filename)
 
 
