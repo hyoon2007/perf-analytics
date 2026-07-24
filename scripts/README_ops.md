@@ -13,6 +13,10 @@ Both pipelines use the **same LLM** — the OAuth2 inference gateway
 (`qwen3-14b-awq`) via `perf_analytics/llm_gateway.py`. There is no local Ollama
 dependency anymore.
 
+How v6 chooses the report **verdict** and **Recommended Actions** (with a
+flowchart) is documented in
+[`perf_analytics_v6/README.md`](perf_analytics_v6/README.md).
+
 The monitor downloads each file once, runs **v6 first, then v1** (separate
 processes, sequential), and moves the file to `processed/` if v6 succeeded, else
 `failed/`. v1 is best-effort: if it crashes (e.g. SHAP OOM on large data) the
