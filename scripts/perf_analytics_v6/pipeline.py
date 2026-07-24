@@ -1002,9 +1002,9 @@ def render_fallback_report(f):
     if b.get("new_visitor_influx"):
         lines.append(f"- Audience indicator (new visitors, not a cause): session-entry "
                      f"share {fmt_pct(b['normal']['landing_share_pct'])} to "
-                     f"{fmt_pct(b['anomaly']['landing_share_pct'])}, browser cache hit median "
-                     f"{fmt_num(b['normal']['client_cacherate_median'])} to "
-                     f"{fmt_num(b['anomaly']['client_cacherate_median'])}")
+                     f"{fmt_pct(b['anomaly']['landing_share_pct'])}, browser cache hit rate median "
+                     f"{fmt_pct(b['normal']['client_cacherate_median'])} to "
+                     f"{fmt_pct(b['anomaly']['client_cacherate_median'])}")
     cov=f.get("coverage")
     if cov and not cov.get("sufficient"):
         lines.append(f"- Coverage note: the sections above explain "
@@ -1542,10 +1542,10 @@ def build_narrative_facts(findings):
         if b.get("new_visitor_influx"):
             cache_note = ""
             if n.get("client_cacherate_median") is not None:
-                # the cache figure is an index, not a duration — never suffix it with ms
+                # cache hit rate is a percentage (upstream sends values <= 100)
                 cache_note = (f", and the median browser cache hit rate from "
-                              f"{fmt_num(n['client_cacherate_median'])} to "
-                              f"{fmt_num(a.get('client_cacherate_median', 0))}")
+                              f"{fmt_pct(n['client_cacherate_median'])} to "
+                              f"{fmt_pct(a.get('client_cacherate_median', 0))}")
             # v6.9.1: these audience figures are computed on the FOCUS section, not
             # the whole site — label the scope so the numbers are not mistaken for
             # sitewide values (e.g. the section cache median differs from sitewide).
