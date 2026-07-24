@@ -1546,8 +1546,15 @@ def build_narrative_facts(findings):
                 cache_note = (f", and the median browser cache hit rate from "
                               f"{fmt_num(n['client_cacherate_median'])} to "
                               f"{fmt_num(a.get('client_cacherate_median', 0))}")
+            # v6.9.1: these audience figures are computed on the FOCUS section, not
+            # the whole site — label the scope so the numbers are not mistaken for
+            # sitewide values (e.g. the section cache median differs from sitewide).
+            scope_seg = b.get("scope")
+            scoped = bool(scope_seg and scope_seg != "overall")
+            scope_prefix = f"Within {page_token(scope_seg)}, " if scoped else ""
+            subject = "session-entry page views" if scope_prefix else "Session-entry page views"
             facts["audience"] = (
-                f"Session-entry page views moved from {fmt_pct(n['landing_share_pct'])} to "
+                f"{scope_prefix}{subject} moved from {fmt_pct(n['landing_share_pct'])} to "
                 f"{fmt_pct(a['landing_share_pct'])}{cache_note}, an indicator of more "
                 f"first-time visitors, not a cause of the slowdown.")
         else:
