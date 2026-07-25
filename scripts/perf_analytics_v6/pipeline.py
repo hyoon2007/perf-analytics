@@ -1018,8 +1018,14 @@ def render_fallback_report(f):
                      f"set may be involved.")
     lines.append("")
     lines.append("## What Did Not Change")
-    if f["delivery"]["verdict"]=="clean":
+    _deliv = f.get("delivery") or {}
+    _has_cdn = "cdncacherate" in (_deliv.get("metrics") or {})
+    if _deliv.get("verdict")=="clean":
         lines.append("- CDN and origin delivery metrics show no regression.")
+        if _has_cdn:
+            lines.append("- The CDN cache hit rate here is derived from client beacons and "
+                         "may differ from the actual cache hit rate reported by the CDN; "
+                         "use it for reference only.")
     if f.get("localization", {}).get("localized"):
         ex=f["localization"]["excluded_p75"]
         lines.append(f"- Excluding the focus section(s), sitewide p75 moved from "
@@ -1735,9 +1741,19 @@ def build_section_facts(findings):
     if "audience_stable" in flat:
         sec["What Did Not Change"].append(flat["audience_stable"])
     delivery = findings.get("delivery") or {}
+    has_cdn = "cdncacherate" in (delivery.get("metrics") or {})
+    # v6.9.1: the CDN cache hit rate is beacon-derived, not the CDN's own figure —
+    # add a reference-only caveat wherever it informed the delivery assessment.
+    cdn_caveat = ("The CDN cache hit rate here is derived from client beacons and may "
+                  "differ from the actual cache hit rate reported by the CDN; use it for "
+                  "reference only.")
     if delivery.get("verdict") == "clean":
         sec["What Did Not Change"].append(
             "CDN and origin delivery metrics show no regression in the anomaly window.")
+        if has_cdn:
+            sec["What Did Not Change"].append(cdn_caveat)
+    elif has_cdn and "cdncacherate" in (delivery.get("issues") or []):
+        sec.setdefault("What Changed", []).append(cdn_caveat)
     loc = findings.get("localization") or {}
     if loc.get("localized") and loc.get("excluded_p75"):
         e = loc["excluded_p75"]
