@@ -377,6 +377,60 @@ def composite_verdict_flags(focus, within_floor_ms=80):
             "focus_p75_delta_ms": round(p75_d, 1)}
 
 
+# ============ v6.9.2: focus sub-segment (audience/device) breakdown ============
+def mem_bucket(v):
+    """Coarse device-memory buckets, used both for the focus breakdown and for
+    the interacted mix/within decomposition (keeps cells dense)."""
+    try:
+        m = float(v)
+    except (TypeError, ValueError):
+        return "na"
+    return "low(<=2GB)" if m <= 2 else "mid(4GB)" if m <= 4 else "high(>=8GB)"
+
+
+_BREAKDOWN_LABELS = {
+    "paidmedia": {"True": "paid-media (ad) entries", "False": "non-paid entries"},
+    "connectiontype": {"Cellular": "cellular connections", "Cable/DSL": "cable/DSL connections",
+                       "Corporate": "corporate networks", "": "unknown-connection traffic"},
+    "mem_bucket": {"low(<=2GB)": "low-memory (<=2GB) devices", "mid(4GB)": "4GB-memory devices",
+                   "high(>=8GB)": "high-memory (>=8GB) devices"},
+    "deviceType": {"Mobile": "mobile devices", "Desktop": "desktop devices", "Tablet": "tablets"},
+}
+
+
+def _breakdown_label(dim, seg):
+    if dim == "country":
+        return humanize_region(seg)
+    return _BREAKDOWN_LABELS.get(dim, {}).get(str(seg), str(seg))
+
+
+def focus_breakdown(focus_df, dims, focus_p75_normal, timer_col="timer",
+                    label_col="label", min_n=100, min_share_pp=1.0, top=3):
+    """Within the focus page section, find the audience/device sub-segments whose
+    share GREW and that carry ABOVE-focus TBT — the composition shift that
+    actually pushed the focus section's aggregate up (e.g. more paid-media,
+    lower-memory, or India traffic on a heavy product page). Returns the top
+    movers across all dims, ranked by contribution (share gain x heaviness)."""
+    cands = []
+    for dim in dims:
+        if dim not in focus_df:
+            continue
+        mv = top_movers(focus_df, dim, timer_col, label_col, min_n=min_n)
+        for r in mv["share_movers"]:
+            if r["share_delta_pp"] < min_share_pp or r["p75_normal"] <= focus_p75_normal:
+                continue  # only sub-segments that GREW and are heavier than the focus itself
+            cands.append({
+                "dim": dim, "segment": str(r["segment"]),
+                "human_label": _breakdown_label(dim, r["segment"]),
+                "share_normal_pct": r["share_normal_pct"], "share_anomaly_pct": r["share_anomaly_pct"],
+                "share_delta_pp": r["share_delta_pp"],
+                "p75_normal": r["p75_normal"], "p75_anomaly": r["p75_anomaly"],
+                "contribution_score": round(r["share_delta_pp"] / 100.0 * (r["p75_normal"] - focus_p75_normal), 1),
+            })
+    cands.sort(key=lambda x: -x["contribution_score"])
+    return cands[:top]
+
+
 # ============================ v4 additions ============================
 def select_focus_segments(primary_movers, overall_win, dim,
                           min_share_pp=1.0, min_p75_delta=80,
@@ -1643,9 +1697,10 @@ def build_narrative_facts(findings):
     if d.get("total_delta_ms") is not None:
         facts["decomposition"] = (
             f"Of the {fmt_ms(d['total_delta_ms'])} {d.get('stat','p75')} increase, "
-            f"{fmt_ms(d.get('mix_effect_ms', 0))} comes from the change in traffic "
-            f"composition and {fmt_ms(d.get('within_effect_ms', 0))} from sections "
-            f"becoming slower in their own right.")
+            f"{fmt_ms(d.get('mix_effect_ms', 0))} comes from a shift in traffic "
+            f"composition toward heavier page/device/traffic-type mixes and only "
+            f"{fmt_ms(d.get('within_effect_ms', 0))} from segments genuinely slowing on "
+            f"their own (holding that mix constant).")
 
     # v6.9.1 FIX: only assert a "new-visitor" audience shift when the
     # new_visitor_influx signal actually fired. Previously this sentence was
@@ -1673,12 +1728,31 @@ def build_narrative_facts(findings):
                 f"{scope_prefix}{subject} moved from {fmt_pct(n['landing_share_pct'])} to "
                 f"{fmt_pct(a['landing_share_pct'])}{cache_note}, an indicator of more "
                 f"first-time visitors, not a cause of the slowdown.")
-        else:
-            # signal did not fire → state plainly that audience mix is not a factor
+        elif not (findings.get("focus_breakdown")):
+            # signal did not fire AND no sub-segment composition shift → state
+            # plainly that audience mix is not a factor. (When focus_breakdown is
+            # present, composition IS the story — see the focus_growth fact — so
+            # this "not a factor" line would contradict it and is suppressed.)
             facts["audience_stable"] = (
                 "Audience-mix signals (session-entry share and browser cache rate) were "
                 "essentially unchanged between the windows, so audience composition is "
                 "not a factor in this change.")
+
+    # v6.9.2: name the audience/device sub-segments that drove the focus section's
+    # rise (e.g. more paid-media, lower-memory, or India traffic on a heavy page),
+    # so the report explains WHERE the growth came from instead of only that the
+    # page group grew.
+    fb = findings.get("focus_breakdown") or []
+    foc = (findings.get("segments") or {}).get("focus") or {}
+    if fb and foc.get("segment"):
+        parts = ", ".join(
+            f"{bi['human_label']} ({fmt_pct(bi['share_normal_pct'])} to "
+            f"{fmt_pct(bi['share_anomaly_pct'])} of that section)" for bi in fb)
+        abbr = (findings.get("meta") or {}).get("metric_abbrev", "TBT")
+        facts["focus_growth"] = (
+            f"Within {page_token(foc['segment'])}, the growth is concentrated in {parts} — "
+            f"all higher-{abbr} sub-segments, so the rise reflects a shift toward heavier "
+            f"traffic on that section rather than the page itself slowing down.")
 
     # v6.9.1 improvement: absolute-severity context. The delta can be small while
     # the baseline is already catastrophic (e.g. TBT p75 far past the 'poor' band).
@@ -1841,7 +1915,7 @@ def build_section_facts(findings):
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
-    for key in ("decomposition", "audience", "client_side", "coverage"):
+    for key in ("focus_growth", "decomposition", "audience", "client_side", "coverage"):
         if key in flat:
             sec["What Changed"].append(flat[key])
 
@@ -2329,6 +2403,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # ---- derived, dataset-agnostic features
     df["page_group"] = derive_page_group(df["url"]) if "url" in df else "all"
     df["referrer_present"] = df["referrer"].notna() if "referrer" in df else False
+    df["mem_bucket"] = df["deviceMemory"].map(mem_bucket) if "deviceMemory" in df else "na"
 
     # ---- representative URL per page group, so the report can cite a concrete
     #      example page instead of only an abstract group name.
@@ -2387,7 +2462,12 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # v6.8: decompose the SAME statistic the report leads with. Percentiles are not
     # additive, so this uses a reweighted counterfactual (DFL) rather than the
     # mean-based Oaxaca split, which quoted a different figure from the headline.
-    p75_decomp = quantile_decomposition(df, PRIMARY_DIM, q=0.75, timer_col=TIMER_COL,
+    # v6.9.2: decompose on an INTERACTED cell key (page_group x device-memory x
+    # paid-media) so a composition shift toward heavier sub-segments (e.g. more
+    # paid / low-memory traffic within a page group) is counted as MIX, not
+    # misattributed to a genuine per-section slowdown (WITHIN).
+    _decomp_key = [PRIMARY_DIM] + [c for c in ("mem_bucket", "paidmedia") if c in df]
+    p75_decomp = quantile_decomposition(df, _decomp_key, q=0.75, timer_col=TIMER_COL,
                                         label_col=LABEL_COL)
     materiality = effect_materiality(p75_decomp, abs_floor_ms=EFFECT_FLOOR_MS)
     print(f"[p75 decomposition] Δ{p75_decomp['total_delta_ms']}ms = "
@@ -2410,12 +2490,17 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     other_watch=other_bucket_watch(primary_movers)
 
     localization, drilldown = None, {}
+    focus_composition = []
     focus_df=df
     if focus:
         localization=localization_check(df, PRIMARY_DIM, focus["segment"], TIMER_COL, LABEL_COL)
         focus_df=df[df[PRIMARY_DIM].astype(str)==focus["segment"]]
         for d in SECONDARY_DIMS:
             drilldown[d]=top_movers(focus_df, d, TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
+        # v6.9.2: which audience/device sub-segments drove the focus section's rise
+        focus_composition=focus_breakdown(
+            focus_df, ["paidmedia", "mem_bucket", "country", "connectiontype", "deviceType"],
+            float(focus["p75_normal"]), TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
 
     print(f"\nfocus sections ({len(focus_list)}):")
     for r in focus_list:
@@ -2434,6 +2519,12 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
 
     # v4: within-regression is per-focus; compute for the primary focus (kept for compatibility)
     within_flags=composite_verdict_flags(focus)
+    # v6.9.2: the focus's raw p75 rise includes sub-composition (more paid /
+    # low-memory traffic within it). Only call it a genuine regression when the
+    # composition-controlled interacted decomposition ALSO shows a material
+    # within effect — otherwise the rise is a mix shift, not a page slowdown.
+    within_flags["within_regression"] = bool(
+        within_flags["within_regression"] and materiality.get("within_material"))
     if focus:
         print(f"primary focus within-regression: {within_flags['within_regression']} "
               f"(median Δ={within_flags['focus_median_delta_ms']}ms, p75 Δ={within_flags['focus_p75_delta_ms']}ms)")
@@ -2542,6 +2633,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
                 f"{fmt_ms(win['delta_p75_ms'])} ({fmt_pct(win['delta_p75_pct'])}).")},
         "verdict": {"code": verdict_code, "sentence": verdict_sentence},
         "within_regression": within_flags,
+        "focus_breakdown": focus_composition,
         "segments": {
             "primary_dim": PRIMARY_DIM,
             "primary_share_movers": _label_movers(primary_movers["share_movers"][:5], PRIMARY_DIM),
