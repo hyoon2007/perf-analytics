@@ -190,7 +190,30 @@ delta가 작아도 baseline 자체가 재앙일 수 있습니다(예 TBT p75 ~2,
 추가 blocking이 네트워크가 아니라 **client-side(메인스레드 JS·서드파티 태그)**에서
 온다는 문장을 추가합니다. 독자가 배달 구간을 헛짚지 않도록 방향을 잡아줍니다.
 
+### 초점 섹션 하위 구성 분해 (v6.9.2)
+초점 페이지 섹션이 커졌을 때, **그 안에서 무엇이 커졌는지**를 명시합니다.
+`focus_breakdown()`이 초점 섹션 내부에서 **비중이 늘고(≥1pp) 초점 평균보다 무거운**
+하위 세그먼트를 차원별(`paidmedia`, `deviceMemory`(버킷), `country`, `connectiontype`,
+`deviceType`)로 찾아, 기여도 순 상위 3개를 `findings.focus_breakdown`에 담고
+*"Within the '<섹션>' section, the growth is concentrated in India (46.8%→49.3%),
+4GB-memory devices (33%→35%), paid-media entries (69.9%→72.7%) — all higher-TBT
+sub-segments …"* 형태로 **What Changed**에 서술합니다. 하위 구성 이동이 있으면 앞의
+*"audience composition is not a factor"* 문구는 모순되므로 자동 억제됩니다.
+
+### 상호작용 mix/within 분해 (v6.9.2)
+`quantile_decomposition`을 **단일 차원(page_group)** 대신 **상호작용 셀 키
+`(page_group × device-memory-bucket × paidmedia)`**로 계산합니다. 이렇게 하면
+"페이지그룹 내부에서 더 무거운 하위 세그먼트(유료·저사양)로의 이동"이 **MIX(구성)**로
+집계되어, page_group 1차원 분해가 이를 **가짜 자체 회귀(WITHIN)로 오귀속**하던 문제를
+바로잡습니다. 또한 `within_regression` 플래그를 이 구성-통제 materiality와 AND로 묶어,
+구성 이동일 뿐인데 verdict가 `mix_shift_with_local_regression`이 되거나 client-side/
+서드파티 회귀로 서술되는 과대주장을 막습니다.
+
+> 검증(7-27 TBT): 분해가 **313ms 구성 / 5ms 자체**, verdict가
+> `mix_shift_with_local_regression` → **`traffic_mix_shift`**로 정정, India·4GB·유료광고가
+> 리포트에 명시됨.
+
 ### 번호 검증과의 관계
-위 문장 중 숫자를 담는 것(headline·decomposition·audience 등)의 값은 findings에서
-그대로 온 화이트리스트 숫자이며, 새로 추가한 심각도·client-side 문장은 **number-free**라
-검증·critic·바인딩 체크를 통과합니다.
+위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown 등)의 값은
+findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한 심각도·client-side 문장은
+**number-free**라 검증·critic·바인딩 체크를 통과합니다.
