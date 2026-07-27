@@ -15,4 +15,6 @@ failed/
 reports/
 data/
 config/*.conf
+config/*.bak
+*.bak
 notebooks/report_preview*.html
