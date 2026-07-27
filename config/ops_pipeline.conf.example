@@ -1,0 +1,37 @@
+# Ops pipeline settings — TEMPLATE.
+# Copy to `ops_pipeline.conf` (git-ignored) and fill in real values on each host.
+# Secrets (FTP/AWS/LLM credentials) live under .sec, never here or in git.
+
+[paths]
+base_data_dir = /opt/perf-analytics
+incoming_dir = /opt/perf-analytics/incoming
+processed_dir = /opt/perf-analytics/processed
+failed_dir = /opt/perf-analytics/failed
+
+[ftp]
+host = ftp.example.com
+user = ftp-user
+# Prefer the secret file or env var over a plaintext password.
+password =
+password_env = FTP_PASSWORD
+password_file = /opt/perf-analytics/.sec/ftp_password
+remote_dir = 000000
+
+[llm]
+# NOTE: vestigial. Both pipelines now use the OAuth2 inference gateway
+# configured in .sec/inference-gateway (see perf_analytics/llm_gateway.py).
+url = http://localhost:11434/api/generate
+model = qwen2.5:7b-instruct
+
+[model]
+min_onehot_on_ratio = 0.01
+
+[retry]
+pipeline_max_retries = 3
+pipeline_backoff_seconds = 30
+email_max_retries = 2
+email_backoff_seconds = 15
+
+[email]
+aws_secret_file = /opt/perf-analytics/.sec/aws-ses
+ses_conf_file = /opt/perf-analytics/config/ses_email.conf

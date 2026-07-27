@@ -1,0 +1,25 @@
+# AWS SES email settings — TEMPLATE.
+# Copy to `ses_email.conf` (git-ignored) and fill in real values on each host.
+# Never commit the real ses_email.conf: this repo is public.
+
+SES_REGION=ap-northeast-1
+SES_FROM_EMAIL=perf-admin@example.com
+
+# Full recipient list. Used by the v1 pipeline (always English) and as the
+# English base for v6 when the per-language lists below are not set.
+SES_TO_EMAIL=alice@example.com,bob@example.com,carol@example.com
+
+# --- v6 per-recipient report language (optional) ---
+# SES_TO_EMAIL_KO : recipients who should get the Korean report.
+# SES_TO_EMAIL_EN : explicit English list (optional).
+# Rules:
+#   - List Korean recipients in _KO; everyone else in SES_TO_EMAIL automatically
+#     stays English (no recipient is dropped). Set _EN only to control the
+#     English list explicitly.
+#   - With neither _KO nor _EN set, everyone gets English (default).
+#   - The Korean email is the validated English report translated by the gateway
+#     LLM (numbers/URLs/metric+product names kept verbatim); on any failure the
+#     recipient is sent the English version instead.
+# Example — alice English, the rest Korean:
+# SES_TO_EMAIL_EN=alice@example.com
+# SES_TO_EMAIL_KO=bob@example.com,carol@example.com
