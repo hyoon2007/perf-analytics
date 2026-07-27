@@ -1106,6 +1106,116 @@ def md_to_html(text):
             + "\n".join(html) + "</body></html>")
 
 
+# ==================== email localization (translate the validated English) ====
+# The English report is the single validated source. For non-English recipients
+# we translate the finished English email via the gateway LLM, keeping every
+# number, unit, URL and product/metric name verbatim, and verify that nothing
+# load-bearing was dropped. On any failure the caller falls back to English.
+_URL_RE = r"https?://[^\s)\]}>\"']+"
+_LANG_NAMES = {"ko": "Korean"}
+
+# Metric and Akamai product/technical names that MUST stay in English. They are
+# swapped for opaque placeholders before translation and restored afterwards, so
+# the model cannot translate them (prompt instructions alone were not reliable).
+# Longest-first so multi-word names are protected before their abbreviations.
+_PROTECTED_TERMS = [
+    "Image & Video Manager", "Adaptive Acceleration", "Tiered Distribution",
+    "Total Blocking Time", "Largest Contentful Paint", "First Contentful Paint",
+    "Time to First Byte", "Interaction to Next Paint", "Cumulative Layout Shift",
+    "First Input Delay", "Script Management", "Cloud Wrapper", "DataStream 2",
+    "EdgeWorkers", "mPulse", "TBT", "LCP", "FCP", "TTFB", "INP", "CLS", "FID",
+]
+
+
+def _preserved_tokens(text):
+    """Numbers (comma-normalized) and URLs that MUST survive translation."""
+    nums = {m.replace(",", "") for m in re.findall(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?", text)}
+    urls = set(re.findall(_URL_RE, text))
+    return nums, urls
+
+
+def _protect_terms(text):
+    """Replace protected English terms with opaque ⟦X#⟧ placeholders."""
+    mapping = {}
+    for i, term in enumerate(_PROTECTED_TERMS):
+        ph = f"⟦X{i}⟧"
+        new, n = re.subn(rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])", ph, text)
+        if n:
+            text, mapping[ph] = new, term
+    return text, mapping
+
+
+def _translate_once(text, target_lang_name):
+    protected, mapping = _protect_terms(text)
+    prompt = (
+        f"Translate the following website-performance report into {target_lang_name}.\n"
+        "STRICT rules:\n"
+        "- Translate the prose only. Keep every number, unit (ms, %, etc.) and URL "
+        "EXACTLY as in the source — never add, drop, round, or reformat a number.\n"
+        "- Do NOT translate or alter any ⟦X…⟧ placeholder token; copy each one "
+        "exactly as-is, in place.\n"
+        "- Preserve the Markdown structure: keep every '##' heading marker and every '-' "
+        "bullet; translate only the visible text after them.\n"
+        "- Output only the translated Markdown. No code fences, no notes, no reasoning.\n\n"
+        f"{protected}"
+    )
+    out = call_llm(prompt)
+    out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL | re.IGNORECASE)
+    out = re.sub(r"</?think>", "", out)
+    missing = [ph for ph in mapping if ph not in out]
+    if missing:
+        raise RuntimeError(f"translation dropped protected tokens: {missing[:3]}")
+    for ph, term in mapping.items():
+        out = out.replace(ph, term)
+    return out.strip()
+
+
+def localize_email(target_lang, subject, plain_md, max_attempts=2):
+    """Translate the English email (subject + plain-Markdown body) into
+    target_lang and return (subject, plain, html). Returns None on any failure —
+    LLM error, unknown language, or a number/URL that did not survive
+    translation — so the caller falls back to the English email. Numbers, units,
+    URLs and product/metric names are required to be preserved verbatim."""
+    if target_lang == "en":
+        return subject, plain_md, md_to_html(plain_md)
+    lang_name = _LANG_NAMES.get(target_lang)
+    if not lang_name:
+        return None
+
+    # body is load-bearing: every number and URL must survive
+    src_nums, src_urls = _preserved_tokens(plain_md)
+    body = None
+    for _ in range(max_attempts):
+        try:
+            cand = _translate_once(plain_md, lang_name)
+        except Exception as exc:
+            print(f"[i18n] body translation error: {exc}")
+            continue
+        c_nums, c_urls = _preserved_tokens(cand)
+        if cand and src_nums <= c_nums and src_urls <= c_urls:
+            body = cand
+            break
+        print(f"[i18n] retry ({target_lang}): missing numbers={sorted(src_nums - c_nums)[:5]} "
+              f"urls={sorted(src_urls - c_urls)[:2]}")
+    if body is None:
+        print(f"[i18n] {target_lang} body failed number/URL preservation; falling back to English")
+        return None
+
+    # subject is best-effort: keep the English subject if translation is unsafe
+    subj_out = subject
+    subj_nums, _ = _preserved_tokens(subject)
+    try:
+        cand_s = _translate_once(subject, lang_name).splitlines()
+        cand_s = cand_s[0].strip() if cand_s else ""
+        cs_nums, _ = _preserved_tokens(cand_s)
+        if cand_s and subj_nums <= cs_nums and "[v6]" in cand_s:
+            subj_out = cand_s
+    except Exception as exc:
+        print(f"[i18n] subject translation error (keeping English): {exc}")
+
+    return subj_out, body, md_to_html(body)
+
+
 # ============================ v3 additions ============================
 PG_TOKEN = "\u27e6PG:{}\u27e7"          # ⟦PG:unpacked⟧ — LLM-opaque placeholder
 

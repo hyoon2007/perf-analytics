@@ -91,12 +91,37 @@ def load_app_config(conf_path: str) -> AppConfig:
 def load_email_credentials(app_cfg: AppConfig) -> Dict[str, str]:
     secret = _load_kv_file(app_cfg.aws_secret_file)
     ses = _load_kv_file(app_cfg.ses_conf_file)
+
+    def _split(s: str):
+        return [e.strip() for e in s.split(",") if e.strip()]
+
+    default_to = ses.get("SES_TO_EMAIL", "").strip()
+    to_en = ses.get("SES_TO_EMAIL_EN", "").strip()
+    to_ko = ses.get("SES_TO_EMAIL_KO", "").strip()
+
+    # v6 per-language routing:
+    #   - SES_TO_EMAIL_KO = recipients who want the Korean report
+    #   - SES_TO_EMAIL_EN = explicit English list (optional)
+    #   - SES_TO_EMAIL    = full/default list (used for v1 and as the English base)
+    # If only KO is set, everyone else in SES_TO_EMAIL automatically stays English
+    # (no recipient is silently dropped). If neither is set, everyone gets English.
+    ko_list = _split(to_ko)
+    if to_en:
+        en_list = _split(to_en)
+    elif ko_list:
+        ko_set = set(ko_list)
+        en_list = [e for e in _split(default_to) if e not in ko_set]
+    else:
+        en_list = _split(default_to)
+
     return {
         "aws_access_key_id": secret.get("AWS_ACCESS_KEY_ID", ""),
         "aws_secret_access_key": secret.get("AWS_SECRET_ACCESS_KEY", ""),
         "ses_region": ses.get("SES_REGION", "ap-northeast-1"),
         "ses_from_email": ses.get("SES_FROM_EMAIL", ""),
-        "ses_to_email": ses.get("SES_TO_EMAIL", ""),
+        "ses_to_email": default_to,               # legacy / v1 path (full list)
+        "ses_to_email_en": ",".join(en_list),     # v6 English recipients
+        "ses_to_email_ko": ",".join(ko_list),     # v6 Korean recipients
     }
 
 

@@ -19,7 +19,7 @@ from pathlib import Path
 from perf_analytics.config_utils import load_app_config, load_email_credentials, resolve_input_path
 from perf_analytics.emailer import send_email
 from perf_analytics.pipeline import fetch_csv_from_ftp
-from perf_analytics_v6.pipeline import run_v6
+from perf_analytics_v6.pipeline import run_v6, localize_email
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,33 +91,55 @@ def main() -> int:
 
     if not args.skip_email:
         email_cfg = load_email_credentials(cfg)
-        email_error = None
-        message_id = None
-        for attempt in range(1, cfg.email_max_retries + 1):
-            try:
-                message_id = send_email(
-                    aws_access_key_id=email_cfg["aws_access_key_id"],
-                    aws_secret_access_key=email_cfg["aws_secret_access_key"],
-                    ses_region=email_cfg["ses_region"],
-                    from_email=email_cfg["ses_from_email"],
-                    to_email=email_cfg["ses_to_email"],
-                    subject=result["email_subject"],
-                    text_body=result["email_plain"],
-                    html_body=result["email_html"],
-                )
-                break
-            except Exception as exc:
-                email_error = exc
-                if attempt < cfg.email_max_retries:
-                    wait_s = cfg.email_backoff_seconds * attempt
-                    print(f"[WARN][v6] Email attempt {attempt} failed: {exc}")
-                    print(f"[INFO][v6] Retrying email in {wait_s}s...")
-                    time.sleep(wait_s)
+        en_to = email_cfg.get("ses_to_email_en", "").strip()
+        ko_to = email_cfg.get("ses_to_email_ko", "").strip()
+        en_subj, en_plain, en_html = (
+            result["email_subject"], result["email_plain"], result["email_html"])
 
-        if message_id:
-            print(f"[INFO][v6] Email sent. MessageId: {message_id}")
-        else:
-            print(f"[ERROR][v6] Email failed after retries: {email_error}")
+        def _send(to_email, subject, text_body, html_body, tag):
+            err = None
+            for attempt in range(1, cfg.email_max_retries + 1):
+                try:
+                    mid = send_email(
+                        aws_access_key_id=email_cfg["aws_access_key_id"],
+                        aws_secret_access_key=email_cfg["aws_secret_access_key"],
+                        ses_region=email_cfg["ses_region"],
+                        from_email=email_cfg["ses_from_email"],
+                        to_email=to_email,
+                        subject=subject,
+                        text_body=text_body,
+                        html_body=html_body,
+                    )
+                    print(f"[INFO][v6] {tag} email sent. MessageId: {mid}")
+                    return mid
+                except Exception as exc:
+                    err = exc
+                    if attempt < cfg.email_max_retries:
+                        wait_s = cfg.email_backoff_seconds * attempt
+                        print(f"[WARN][v6] {tag} email attempt {attempt} failed: {exc}")
+                        print(f"[INFO][v6] Retrying {tag} email in {wait_s}s...")
+                        time.sleep(wait_s)
+            print(f"[ERROR][v6] {tag} email failed after retries: {err}")
+            return None
+
+        # English recipients
+        if en_to:
+            _send(en_to, en_subj, en_plain, en_html, "EN")
+
+        # Korean recipients: translate the validated English email; on any
+        # failure fall back to sending the English version (never drop the send).
+        if ko_to:
+            loc = None
+            try:
+                loc = localize_email("ko", en_subj, en_plain)
+            except Exception as exc:
+                print(f"[WARN][v6] KO localization error: {exc}")
+            if loc is None:
+                print("[INFO][v6] KO localization unavailable; sending English to KO recipients")
+                _send(ko_to, en_subj, en_plain, en_html, "KO(fallback-EN)")
+            else:
+                ko_subj, ko_plain, ko_html = loc
+                _send(ko_to, ko_subj, ko_plain, ko_html, "KO")
 
     if not args.no_move:
         target = cfg.processed_dir / csv_path.name

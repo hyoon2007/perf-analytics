@@ -41,6 +41,27 @@ pip install -r scripts/requirements_ops.txt
 Secrets and `config/*.conf` are git-ignored — apply changes to them directly on
 the server; they do not travel through git.
 
+### Per-recipient report language (v6 only)
+
+v6 can send each recipient the report in English or Korean. In `ses_email.conf`:
+
+```
+SES_TO_EMAIL    = a@x.com,b@y.com,dmacho@naver.com   # full list (also used by v1)
+SES_TO_EMAIL_KO = dmacho@naver.com                   # who wants the Korean report
+# SES_TO_EMAIL_EN = a@x.com,b@y.com                  # optional explicit English list
+```
+
+Rules:
+- List the Korean recipients in `SES_TO_EMAIL_KO`; everyone else in `SES_TO_EMAIL`
+  automatically gets English (no one is dropped). Set `SES_TO_EMAIL_EN` only if you
+  want to control the English list explicitly.
+- With neither `_KO` nor `_EN` set, everyone gets English (current behavior).
+- The Korean email is produced by translating the **validated English** report via
+  the gateway LLM; numbers, units, URLs and metric/product names (e.g. Total
+  Blocking Time, EdgeWorkers, DataStream 2) are kept verbatim. If translation fails
+  any check, that recipient is sent the English version instead (never dropped).
+- v1 always emails the full `SES_TO_EMAIL` list in English.
+
 ## 3) Run once — v6
 
 ```bash
