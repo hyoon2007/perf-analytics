@@ -431,6 +431,25 @@ def focus_breakdown(focus_df, dims, focus_p75_normal, timer_col="timer",
     return cands[:top]
 
 
+def focus_regression_split(focus_df, timer_col="timer", label_col="label",
+                           dims=("country", "mem_bucket", "paidmedia"), abs_floor_ms=50):
+    """Split a focus page type's OWN p75 change into (a) a shift in its internal
+    traffic mix (more India / low-memory / paid traffic inside it) vs (b) a
+    genuine same-audience slowdown, using the interacted-cell DFL decomposition
+    on the section's own rows. Returns the two effects and a `genuine_regression`
+    flag that is True only when the genuine part is BOTH material AND the larger
+    of the two — so a rise driven mostly by an internal mix shift is not labelled
+    'the page slowed on its own'."""
+    key = [d for d in dims if d in focus_df]
+    if not key or (focus_df[label_col] == 1).sum() == 0 or (focus_df[label_col] == 0).sum() == 0:
+        return {"mix_effect_ms": 0.0, "within_effect_ms": 0.0, "genuine_regression": False}
+    dec = quantile_decomposition(focus_df, key, q=0.75, timer_col=timer_col, label_col=label_col)
+    mat = effect_materiality(dec, abs_floor_ms=abs_floor_ms)
+    within, mix = dec["within_effect_ms"], dec["mix_effect_ms"]
+    return {"mix_effect_ms": mix, "within_effect_ms": within,
+            "genuine_regression": bool(mat.get("within_material") and within >= mix)}
+
+
 # ============================ v4 additions ============================
 def select_focus_segments(primary_movers, overall_win, dim,
                           min_share_pp=1.0, min_p75_delta=80,
@@ -895,7 +914,9 @@ def select_verdict(severity, decomp_primary, localization, behavior,
 
     if multi:
         s=(f"The slowdown spans {n_focus} page types rather than one. ")
-        any_self=any(r.get("self_regressed") for r in focus_list)
+        # v6.9.4: "slowed on its own" now means the composition-controlled genuine
+        # regression, not a raw per-section p75 rise driven by an internal mix shift.
+        any_self=any(r.get("genuine_regression") for r in focus_list)
         any_share=any(r.get("gained_share") for r in focus_list)
         # A per-section p75 rise only becomes the headline story when the
         # aggregate within-segment effect is material; otherwise the composition
@@ -1793,20 +1814,25 @@ def build_narrative_facts(findings):
             "section — rather than in network delivery.")
 
     for r in (findings.get("segments", {}).get("focus_list") or []):
-        # v6.9.3: state each page type's ROLE, so a section that lost share yet
-        # slowed on its own (share down, p75 up) is not read as "grew its share".
-        gained, selfreg = r.get("gained_share"), r.get("self_regressed")
-        if gained and selfreg:
-            role = (" — it both grew its share of traffic and slowed on its own, so it "
-                    "needs investigating on its own merits.")
-        elif selfreg and not gained:
-            role = (" — its traffic share actually fell, so the p75 rise is a genuine "
-                    "local regression on that page type (not a traffic-mix effect) and "
-                    "should be investigated directly.")
+        # v6.9.4: base the role on the composition-controlled split, not the raw
+        # p75 delta. `genuine_regression` is True only when the section genuinely
+        # slowed holding its OWN internal traffic mix constant — so a rise driven
+        # by an internal shift (e.g. more India / paid traffic inside it) reads as
+        # a mix effect, matching the sub-segment breakdown that follows.
+        gained, genuine = r.get("gained_share"), r.get("genuine_regression")
+        if genuine and gained:
+            role = (" — it grew its share AND, holding its own internal traffic mix "
+                    "constant, still slowed genuinely; investigate both.")
+        elif genuine:
+            role = (" — its share fell yet, holding its own internal mix constant, it "
+                    "genuinely slowed — a real local regression to investigate directly.")
         elif gained:
-            role = " — it grew its share of already-heavier traffic."
+            role = (" — its p75 rose mainly because it drew more of its own heavier "
+                    "traffic (a shift in its internal country/device/traffic mix), not "
+                    "because the page itself slowed down.")
         else:
-            role = ""
+            role = (" — holding its own internal mix constant it did not genuinely slow "
+                    "down; the p75 move reflects a shift in its internal traffic mix.")
         facts[f"section::{r['segment']}"] = (
             f"{page_token(r['segment'])} moved from {fmt_pct(r['share_normal_pct'])} to "
             f"{fmt_pct(r['share_anomaly_pct'])} of traffic, with its own p75 going from "
@@ -2523,6 +2549,17 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
             _urls = _sub["url"].dropna().astype(str).map(lambda u: u.split("?")[0])
             if len(_urls):
                 PAGE_GROUP_URLS[focus["segment"]] = _urls.value_counts().index[0]
+
+    # v6.9.4: for EACH focus page type, split its own p75 rise into an internal
+    # mix shift vs a genuine same-audience slowdown, so the role label reflects
+    # what really happened (a section whose rise is mostly an internal India /
+    # device / paid shift is NOT called 'the page slowed on its own').
+    for _r in focus_list:
+        _seg_df = df[df[PRIMARY_DIM].astype(str) == _r["segment"]]
+        _split = focus_regression_split(_seg_df, TIMER_COL, LABEL_COL, abs_floor_ms=EFFECT_FLOOR_MS)
+        _r["genuine_regression"] = _split["genuine_regression"]
+        _r["subcomp_mix_ms"] = _split["mix_effect_ms"]
+        _r["genuine_within_ms"] = _split["within_effect_ms"]
 
     print(f"\nfocus sections ({len(focus_list)}):")
     for r in focus_list:
