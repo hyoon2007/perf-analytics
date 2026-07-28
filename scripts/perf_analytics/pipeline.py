@@ -11,6 +11,11 @@ import pandas as pd
 import shap
 import xgboost as xgb
 
+# Max rows fed to the SHAP explainer. The SHAP value matrix is
+# rows x one-hot-features; on high-cardinality data the full frame can allocate
+# tens of GB and OOM the host, so the explanation is computed on a sample.
+SHAP_SAMPLE = 15000
+
 
 @dataclass
 class PipelineResult:
@@ -502,12 +507,24 @@ def run_pipeline(
     model = xgb.XGBClassifier(eval_metric="logloss")
     model.fit(X, y, sample_weight=weights)
 
+    # SHAP on the full frame can exhaust RAM: the value matrix is
+    # rows x one-hot-features, and high-cardinality columns (url, isp) blow the
+    # feature count up, so a large window can allocate tens of GB and OOM the
+    # box. Sample rows for the explanation — importances/directions are stable
+    # under sampling. (Mirrors the v6 pipeline, which already samples SHAP.)
+    if len(X) > SHAP_SAMPLE:
+        rng = np.random.default_rng(42)
+        sample_idx = rng.choice(len(X), SHAP_SAMPLE, replace=False)
+        X_shap, y_shap = X.iloc[sample_idx], y.iloc[sample_idx]
+    else:
+        X_shap, y_shap = X, y
+
     explainer = shap.Explainer(model)
-    shap_values = explainer(X)
+    shap_values = explainer(X_shap)
     shap_array = shap_values.values if hasattr(shap_values, "values") else np.asarray(shap_values)
 
     timer_state = _compute_timer_state(df, y, timer_metric_name)
-    feature_impact = _build_feature_impact(X, shap_array, y)
+    feature_impact = _build_feature_impact(X_shap, shap_array, y_shap)
 
     selected_features, selected_appendix, selected_score_col, _, _ = _select_directional_features(
         feature_impact,
@@ -552,7 +569,7 @@ def run_pipeline(
         f"- {name}" for name in sorted(set(selected_features["feature"].tolist()) | set(selected_appendix["feature"].tolist()))
     )
 
-    feature_context_df = _build_feature_context_df(X, shap_array, selected_features)
+    feature_context_df = _build_feature_context_df(X_shap, shap_array, selected_features)
     feature_context_text = feature_context_df.to_string(index=False) if len(feature_context_df) > 0 else "No context rows available."
 
     dataset_rows = int(len(X))

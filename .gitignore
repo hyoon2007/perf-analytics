@@ -12,6 +12,7 @@ venv*/
 incoming/
 processed/
 failed/
+.state/
 reports/
 data/
 config/*.conf

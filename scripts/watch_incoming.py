@@ -8,14 +8,14 @@ Polls the remote FTP server every --interval seconds. When a new .csv appears:
      runner, each as a SEPARATE subprocess with --no-move;
   3. it moves the file to processed/ if v6 succeeded, else to failed/.
 
-Crash isolation: each runner is its own process, so if v1 dies in SHAP
-(OOM/segfault on large data) the monitor and the already-finished v6 run are
-unaffected. v1 is best-effort — its exit code never blocks the file lifecycle.
-Running the two sequentially (not concurrently) also avoids a combined
-memory spike taking down the v6 run.
-
-incoming/ is only a transient staging area here; the monitor always moves the
-file out to processed/ or failed/ once both runners return.
+Durability (v6.9.3):
+  * The set of handled files is persisted to a state file, so a restart does
+    NOT re-baseline the whole FTP listing. Files that arrived while the monitor
+    was down are picked up on the next poll instead of being silently ignored.
+  * A file is marked handled right after v6 runs, so a later crash (e.g. v1
+    OOM taking the process down) never causes v6 to re-send its report.
+  * On startup, any file left in incoming/ that is already marked handled is
+    swept to processed/ (its move was interrupted).
 """
 from __future__ import annotations
 
@@ -35,6 +35,24 @@ VALID_EXTS = (".csv",)
 SCRIPT_DIR = Path(__file__).resolve().parent
 V6_RUNNER = SCRIPT_DIR / "run_v6_report.py"
 V1_RUNNER = SCRIPT_DIR / "run_timerweight_report.py"
+
+
+def _state_path(cfg: AppConfig) -> Path:
+    return cfg.data_dir / ".state" / "seen_ftp.txt"
+
+
+def _load_seen(path: Path):
+    """Return the persisted handled-file set, or None if there is no state yet."""
+    if not path.exists():
+        return None
+    return {ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()}
+
+
+def _persist_seen(path: Path, seen: set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(sorted(seen)) + "\n", encoding="utf-8")
+    tmp.replace(path)  # atomic
 
 
 def _list_ftp_files(cfg: AppConfig) -> set[str]:
@@ -73,7 +91,7 @@ def _run_runner(runner_script: Path, filename: str, cfg_path: str, label: str,
 
 
 def _process_new_file(filename: str, cfg: AppConfig, cfg_path: str,
-                      extra_args: list[str]) -> None:
+                      extra_args: list[str], seen: set[str], state_path: Path) -> None:
     print(f"[MONITOR] New FTP file detected: {filename}")
 
     # 1) download ONCE into incoming/
@@ -88,23 +106,42 @@ def _process_new_file(filename: str, cfg: AppConfig, cfg_path: str,
             local_target=local_target,
         )
     except Exception as exc:
+        # transient — do NOT mark handled, so it is retried on the next poll
         print(f"[MONITOR] Download failed for {filename}: {exc}")
         return
 
     name = local_target.name
 
-    # 2) v6 first (the pipeline we are moving to), then v1 (best-effort)
+    # 2) v6 first (the pipeline we are moving to)
     v6_rc = _run_runner(V6_RUNNER, name, cfg_path, "v6", extra_args)
+
+    # Mark handled as soon as v6 has run: if the process dies during v1 (e.g. an
+    # OOM), a restart must not re-send v6's report for this file.
+    seen.add(filename)
+    _persist_seen(state_path, seen)
+
+    # 3) v1 (best-effort — its outcome never blocks the file lifecycle)
     v1_rc = _run_runner(V1_RUNNER, name, cfg_path, "v1", extra_args)
     if v1_rc != 0:
         print(f"[MONITOR] v1 returned {v1_rc} (best-effort; not blocking) for {name}")
 
-    # 3) file lifecycle keyed on v6 outcome
+    # 4) file lifecycle keyed on v6 outcome
     dest_dir = cfg.processed_dir if v6_rc == 0 else cfg.failed_dir
     target = dest_dir / name
     if local_target.exists() and local_target.resolve() != target.resolve():
         shutil.move(str(local_target), str(target))
     print(f"[MONITOR] Moved {name} to {'processed' if v6_rc == 0 else 'failed'}: {target}")
+
+
+def _sweep_incoming_orphans(cfg: AppConfig, seen: set[str]) -> None:
+    """A file left in incoming/ that is already marked handled means its move was
+    interrupted (v6 had run). Move it to processed/ so it does not linger."""
+    for f in cfg.incoming_dir.glob("*.csv"):
+        if f.name in seen:
+            target = cfg.processed_dir / f.name
+            if f.resolve() != target.resolve():
+                shutil.move(str(f), str(target))
+            print(f"[MONITOR] Swept orphaned incoming file to processed: {f.name}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,6 +158,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cfg = load_app_config(args.config)
+    state_path = _state_path(cfg)
 
     extra_args: list[str] = []
     if args.skip_llm:
@@ -131,18 +169,34 @@ def main() -> int:
     print(f"[MONITOR] FTP host  : {cfg.ftp_host}/{cfg.ftp_remote_dir}")
     print(f"[MONITOR] Poll every: {args.interval}s")
     print(f"[MONITOR] Runners   : v6={V6_RUNNER.name}, v1={V1_RUNNER.name} (v6 first, v1 best-effort)")
+    print(f"[MONITOR] State file: {state_path}")
 
-    # Seed initial snapshot so we don't re-process files already on the server.
-    seen: set[str] = _list_ftp_files(cfg)
-    print(f"[MONITOR] Baseline snapshot: {len(seen)} file(s) on FTP (will not reprocess).")
+    seen = _load_seen(state_path)
+    if seen is None:
+        # First ever run: baseline the current FTP listing so we do not reprocess
+        # history. Every later restart loads the persisted set instead.
+        seen = _list_ftp_files(cfg)
+        _persist_seen(state_path, seen)
+        print(f"[MONITOR] No state file — baselined {len(seen)} file(s) on FTP (will not reprocess).")
+    else:
+        print(f"[MONITOR] Loaded {len(seen)} handled file(s) from state.")
 
+    # Recover anything interrupted by a previous crash/restart.
+    _sweep_incoming_orphans(cfg, seen)
+
+    first = True
     while True:
-        time.sleep(args.interval)
+        if not first:
+            time.sleep(args.interval)
+        first = False
         current = _list_ftp_files(cfg)
+        # New = on FTP but not yet handled. This catches files that arrived while
+        # the monitor was down (the old baseline-on-restart logic swallowed them).
         new_files = current - seen
+        if new_files:
+            print(f"[MONITOR] {len(new_files)} unhandled file(s) to process.")
         for filename in sorted(new_files):
-            _process_new_file(filename, cfg, args.config, extra_args)
-            seen.add(filename)
+            _process_new_file(filename, cfg, args.config, extra_args, seen, state_path)
 
 
 if __name__ == "__main__":

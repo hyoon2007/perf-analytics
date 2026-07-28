@@ -11,6 +11,10 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/perf-analytics/venv/bin/python /opt/perf-analytics/scripts/watch_incoming.py --config /opt/perf-analytics/config/ops_pipeline.conf --interval 300
 Restart=always
 RestartSec=10
+# Don't tear down the whole service if a child (e.g. the v1 runner) is OOM-killed,
+# and make the kernel prefer a runaway child over the monitor itself.
+OOMPolicy=continue
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target
