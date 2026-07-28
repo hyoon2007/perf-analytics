@@ -213,6 +213,21 @@ sub-segments …"* 형태로 **What Changed**에 서술합니다. 하위 구성 
 > `mix_shift_with_local_regression` → **`traffic_mix_shift`**로 정정, India·4GB·유료광고가
 > 리포트에 명시됨.
 
+### 페이지 유형별 자체-회귀 판정 (v6.9.4)
+focus 페이지 유형의 "자체적으로 느려졌다" 역할 문구는 **원(raw) p75 변화가 아니라 그
+유형의 구성-통제 분해**에 근거합니다. `focus_regression_split()`이 각 focus 유형의 자체
+p75 변화를 `(country × mem_bucket × paidmedia)` 셀 DFL로 **mix(내부 구성 이동) vs
+within(같은-오디언스 자체 저하)**으로 나누고, `genuine_regression = within이 material AND
+within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않으면 "무거운 자체
+트래픽을 더 끌어들인 구성 효과, 페이지 자체는 느려지지 않음"으로 서술 → focus_breakdown
+서술과 모순되지 않습니다. `select_verdict`의 multi-segment `any_self`도 이 플래그를 씁니다.
+
+> 검증(7-28_1143 TBT): `smartphones` mix +476 / within +127 → **구성 효과**(자체 저하 아님),
+> `watches` mix +872 / within +1,079 → **자체 회귀**(직접 조사). 이전에는 둘 다 raw p75
+> 상승만으로 "자체 저하"로 잘못 표기돼 하위 구성 서술과 모순됐음.
+>
+> 고객 설명용 시각 문서(구성 vs 자체 분해, 위 예시 포함)는 아티팩트로 별도 제공됨.
+
 ### 번호 검증과의 관계
 위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown 등)의 값은
 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한 심각도·client-side 문장은
