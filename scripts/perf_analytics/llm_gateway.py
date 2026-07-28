@@ -187,14 +187,18 @@ class GatewayClient:
         fields |= {f for f in OPTIONAL_BODY_FIELDS if f in text}
         return fields
 
-    def chat(self, prompt: str, timeout: int = 300, json_mode: bool = False) -> str:
+    def chat(self, prompt: str, timeout: int = 300, json_mode: bool = False,
+             max_tokens: int | None = None) -> str:
         """Return the assistant message content. Refreshes the token on 401/403;
-        drops optional body fields the gateway refuses (400/422)."""
+        drops optional body fields the gateway refuses (400/422). `max_tokens`
+        overrides the configured default (e.g. long translations need more)."""
         cfg = self.cfg
+        mt = max_tokens if max_tokens is not None else cfg.max_tokens
         if cfg.backend == "ollama":
             r = requests.post(cfg.ollama_url, timeout=timeout, json={
                 "model": cfg.model, "prompt": prompt, "stream": False,
-                "options": {"temperature": cfg.temperature, "top_p": cfg.top_p},
+                "options": {"temperature": cfg.temperature, "top_p": cfg.top_p,
+                            "num_predict": mt},
                 **({"format": "json"} if json_mode else {})})
             r.raise_for_status()
             return r.json().get("response", "")
@@ -204,7 +208,7 @@ class GatewayClient:
                    "messages": [{"role": "user", "content": prompt}]}
         optional = {"temperature": cfg.temperature,
                     "top_p": cfg.top_p,
-                    "max_tokens": cfg.max_tokens,
+                    "max_tokens": mt,
                     "chat_template_kwargs": {"enable_thinking": cfg.enable_thinking}}
         if json_mode:
             optional["response_format"] = {"type": "json_object"}

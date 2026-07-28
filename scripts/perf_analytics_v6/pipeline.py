@@ -58,10 +58,10 @@ MAX_ATTEMPTS = 4
 # ---------------------------------------------------------------------------
 _CLIENT: GatewayClient | None = None
 
-def call_llm(prompt, timeout=300, json_mode=False):
+def call_llm(prompt, timeout=300, json_mode=False, max_tokens=None):
     if _CLIENT is None:
         raise RuntimeError("LLM client not initialised; call run_v6() which sets it up.")
-    return _CLIENT.chat(prompt, timeout=timeout, json_mode=json_mode)
+    return _CLIENT.chat(prompt, timeout=timeout, json_mode=json_mode, max_tokens=max_tokens)
 
 def list_models(timeout=60):
     if _CLIENT is None:
@@ -406,7 +406,7 @@ def _breakdown_label(dim, seg):
 
 def focus_breakdown(focus_df, dims, focus_p75_normal, timer_col="timer",
                     label_col="label", min_n=100, min_share_pp=1.0, top=3):
-    """Within the focus page section, find the audience/device sub-segments whose
+    """Within the focus page type, find the audience/device sub-segments whose
     share GREW and that carry ABOVE-focus TBT — the composition shift that
     actually pushed the focus section's aggregate up (e.g. more paid-media,
     lower-memory, or India traffic on a heavy product page). Returns the top
@@ -826,7 +826,7 @@ def humanize_feature(feat, overrides=None):
     if feat in overrides:
         return overrides[feat]
     generic = {
-        "page_group": "the '{v}' page section",
+        "page_group": "the '{v}' page type",
         "country": "traffic from region '{v}'",
         "isp": "users on network provider '{v}'",
         "connectiontype": "'{v}' network connections",
@@ -894,7 +894,7 @@ def select_verdict(severity, decomp_primary, localization, behavior,
                                  within_flags and within_flags.get("within_regression")))
 
     if multi:
-        s=(f"The slowdown spans {n_focus} page sections rather than one. ")
+        s=(f"The slowdown spans {n_focus} page types rather than one. ")
         any_self=any(r.get("self_regressed") for r in focus_list)
         any_share=any(r.get("gained_share") for r in focus_list)
         # A per-section p75 rise only becomes the headline story when the
@@ -902,18 +902,21 @@ def select_verdict(severity, decomp_primary, localization, behavior,
         # shift is the real driver and the verdict must not contradict the
         # decomposition printed alongside it.
         regression_story = bool(any_self and within_material)
-        if regression_story and any_share:
-            s+=("Some grew their share of traffic while others became slower on "
-                "their own; the report lists each with its own evidence.")
-        elif regression_story:
-            s+="Several sections became genuinely slower in the anomaly window."
+        # Describe what actually happened per role — a co-focus can slow on its
+        # own WITHOUT gaining share, so never blanket-claim they all grew share.
+        if any_share and any_self:
+            s+=("Some grew their share of heavier traffic while others slowed on their "
+                "own even as their share fell; each is listed with its own evidence.")
+        elif any_share:
+            s+=("The slower page types grew their share of traffic while the rest of the "
+                "site held steady.")
         else:
-            s+=("Several slower sections grew their share of traffic while the rest "
-                "of the site held steady.")
+            s+=("These page types slowed on their own in the anomaly window even without "
+                "gaining traffic share.")
         code="multi_segment_regression" if regression_story else "multi_segment_mix_shift"
     elif mix_material and within_material:
         code="mix_shift_with_local_regression"
-        s=("The slowdown has two compounding causes: a slower page section grew its "
+        s=("The slowdown has two compounding causes: a slower page type grew its "
            "share of traffic AND that section became genuinely slower on its own in "
            "the anomaly window.")
         if behavior.get("new_visitor_influx"):
@@ -922,7 +925,7 @@ def select_verdict(severity, decomp_primary, localization, behavior,
                 "campaign or event launch.")
     elif mix_material:
         code="traffic_mix_shift"
-        s=("The slowdown is a traffic-composition effect: a slower page section grew "
+        s=("The slowdown is a traffic-composition effect: a slower page type grew "
            "its share of traffic while the rest of the site held steady or improved.")
         if behavior.get("new_visitor_influx"):
             s+=(" The incoming traffic shows a new-visitor pattern (more session "
@@ -991,7 +994,7 @@ Strict rules:
 - English only.
 - Use ONLY numbers that literally appear in the FINDINGS JSON. Never compute,
   convert, or invent numbers. If unsure, omit the number.
-- To refer to any page section, write its token EXACTLY as given in
+- To refer to any page type, write its token EXACTLY as given in
   findings (e.g. the "token" field, like \u27e6PG:unpacked\u27e7). Do NOT
   rewrite, translate, or expand tokens; copy them verbatim. A later step
   turns each token into a readable name and an example URL.
@@ -1010,7 +1013,7 @@ Output format (Markdown, exactly these sections):
 ## Executive Summary
 (2-3 sentences: the transition sentence in your own words, then the verdict.)
 ## What Changed
-(List EVERY page section in findings.segments.focus_list, each with its token
+(List EVERY page type in findings.segments.focus_list, each with its token
 and its own share/p75 change and role. If findings.coverage.sufficient is
 false, state plainly that the listed sections do not fully explain the change.
 Present behavior items as audience indicators, never as causes.)
@@ -1030,7 +1033,7 @@ FINDINGS JSON:
 def render_fallback_report(f):
     """Deterministic report. v4: iterates over ALL focus segments and adds a
     coverage note when the identified sections don't fully explain the change."""
-    from_token=f.get("_token_fn", lambda s: f"the '{s}' page section")
+    from_token=f.get("_token_fn", lambda s: f"the '{s}' page type")
     h,v=f["headline"], f["verdict"]
     lines=["## Executive Summary", h["transition_sentence"], v["sentence"], ""]
     lines.append("## What Changed")
@@ -1046,7 +1049,7 @@ def render_fallback_report(f):
             lines.append(f"- {tok} ({role}): " + "; ".join(bits))
         extra=f["segments"].get("additional_count", 0)
         if extra:
-            lines.append(f"- Plus {extra} more page section(s) with smaller contributions.")
+            lines.append(f"- Plus {extra} more page type(s) with smaller contributions.")
     else:
         for mv in f["segments"]["primary_share_movers"][:3]:
             lines.append(f"- {from_token(mv['segment'])}: traffic share "
@@ -1068,7 +1071,7 @@ def render_fallback_report(f):
     ob=f.get("other_watch")
     if ob and ob.get("flagged"):
         lines.append(f"- The catch-all 'other' bucket also degraded "
-                     f"(p75 +{fmt_ms(ob['p75_delta_ms'])}); a page section beyond the tracked "
+                     f"(p75 +{fmt_ms(ob['p75_delta_ms'])}); a page type beyond the tracked "
                      f"set may be involved.")
     lines.append("")
     lines.append("## What Did Not Change")
@@ -1088,13 +1091,13 @@ def render_fallback_report(f):
     lines.append("## Recommended Actions")
     actions={
         "traffic_mix_shift":[
-            "Pre-optimize the growing page section's largest visual element (preload, right-sized images) for first-time mobile visitors.",
+            "Pre-optimize the growing page type's largest visual element (preload, right-sized images) for first-time mobile visitors.",
             "Apply adaptive image/video delivery for cellular connections in the growing regions.",
             "Split alerting by page group and region during campaign periods to avoid composition-driven alerts."],
         "mix_shift_with_local_regression":[
             "Investigate the growing section's own slowdown: compare the LCP element and resource waterfall between the two windows.",
             "Pre-optimize that section's hero image/video (preload, right-sized, adaptive for cellular) for cold-cache first-time visitors.",
-            "Verify no recent release or third-party tag change landed on that section in the anomaly window.",
+            "Verify no recent release or third-party tag change landed on that page type in the anomaly window.",
             "Split alerting by page group and region so the composition shift and the local regression are tracked separately."],
         "multi_segment_mix_shift":[
             "Address each listed section's traffic growth: right-size and preload its main visual element for new mobile visitors.",
@@ -1202,18 +1205,23 @@ def _protect_terms(text):
 def _translate_once(text, target_lang_name):
     protected, mapping = _protect_terms(text)
     prompt = (
-        f"Translate the following website-performance report into {target_lang_name}.\n"
-        "STRICT rules:\n"
-        "- Translate the prose only. Keep every number, unit (ms, %, etc.) and URL "
-        "EXACTLY as in the source — never add, drop, round, or reformat a number.\n"
-        "- Do NOT translate or alter any ⟦X…⟧ placeholder token; copy each one "
-        "exactly as-is, in place.\n"
-        "- Preserve the Markdown structure: keep every '##' heading marker and every '-' "
-        "bullet; translate only the visible text after them.\n"
+        f"You are a senior web-performance analyst. Rewrite the following report in "
+        f"fluent, natural {target_lang_name} for a professional audience.\n"
+        "Guidance:\n"
+        f"- Write idiomatic, easy-to-read {target_lang_name} as a native analyst would — "
+        "convey the meaning naturally, do NOT translate word-for-word or keep stiff "
+        "English sentence structure.\n"
+        "- Keep every number, unit (ms, %, etc.) and URL EXACTLY as in the source — "
+        "never add, drop, round, or reformat a number.\n"
+        "- Do NOT translate or alter any ⟦X…⟧ placeholder token; copy each one exactly "
+        "as-is, in place (these are product/metric names kept in English).\n"
+        "- Preserve the Markdown structure: keep every '##' heading and every '-' bullet, "
+        "and translate ALL of them through to the very last line — do not stop early.\n"
         "- Output only the translated Markdown. No code fences, no notes, no reasoning.\n\n"
         f"{protected}"
     )
-    out = call_llm(prompt)
+    # long reports need more than the default 2048-token cap or the tail is cut off
+    out = call_llm(prompt, max_tokens=4096)
     out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL | re.IGNORECASE)
     out = re.sub(r"</?think>", "", out)
     missing = [ph for ph in mapping if ph not in out]
@@ -1284,7 +1292,7 @@ def render_page_tokens(text, url_map, label_map):
     seen = set()
     def _repl(m):
         seg = m.group(1)
-        label = label_map.get(seg, f"the '{seg}' page section")
+        label = label_map.get(seg, f"the '{seg}' page type")
         url = url_map.get(seg)
         if seg in seen or not url:
             return label
@@ -1489,14 +1497,14 @@ def inject_segment_urls(text, url_map, label_map, focus_segments=None):
       1. resolve ⟦PG:seg⟧ tokens (if the model cooperated),
       2. otherwise annotate the first plain-prose mention of the segment name
          (quoted / hyphen / underscore / case variants),
-      3. append a 'Page Sections Referenced' block for anything still missing.
+      3. append a 'Page Types Referenced' block for anything still missing.
     """
     out = text
 
     seen = set()
     def _tok(m):
         seg = m.group(1)
-        lbl = label_map.get(seg, f"the '{seg}' page section")
+        lbl = label_map.get(seg, f"the '{seg}' page type")
         url = url_map.get(seg)
         if seg in seen or not url:      # annotate the first mention only
             return lbl
@@ -1532,7 +1540,7 @@ def inject_segment_urls(text, url_map, label_map, focus_segments=None):
     missing = [s for s in (focus_segments or [])
                if s not in annotated and url_map.get(s)]
     if missing:
-        block = ["", "## Page Sections Referenced"]
+        block = ["", "## Page Types Referenced"]
         block += [f"- {label_map.get(s, s)}: {url_map[s]}" for s in missing]
         out = out.rstrip() + "\n" + "\n".join(block)
     return out
@@ -1747,12 +1755,12 @@ def build_narrative_facts(findings):
     if fb and foc.get("segment"):
         parts = ", ".join(
             f"{bi['human_label']} ({fmt_pct(bi['share_normal_pct'])} to "
-            f"{fmt_pct(bi['share_anomaly_pct'])} of that section)" for bi in fb)
+            f"{fmt_pct(bi['share_anomaly_pct'])} of that page type)" for bi in fb)
         abbr = (findings.get("meta") or {}).get("metric_abbrev", "TBT")
         facts["focus_growth"] = (
             f"Within {page_token(foc['segment'])}, the growth is concentrated in {parts} — "
             f"all higher-{abbr} sub-segments, so the rise reflects a shift toward heavier "
-            f"traffic on that section rather than the page itself slowing down.")
+            f"traffic on that page type rather than the page itself slowing down.")
 
     # v6.9.1 improvement: absolute-severity context. The delta can be small while
     # the baseline is already catastrophic (e.g. TBT p75 far past the 'poor' band).
@@ -1785,10 +1793,24 @@ def build_narrative_facts(findings):
             "section — rather than in network delivery.")
 
     for r in (findings.get("segments", {}).get("focus_list") or []):
+        # v6.9.3: state each page type's ROLE, so a section that lost share yet
+        # slowed on its own (share down, p75 up) is not read as "grew its share".
+        gained, selfreg = r.get("gained_share"), r.get("self_regressed")
+        if gained and selfreg:
+            role = (" — it both grew its share of traffic and slowed on its own, so it "
+                    "needs investigating on its own merits.")
+        elif selfreg and not gained:
+            role = (" — its traffic share actually fell, so the p75 rise is a genuine "
+                    "local regression on that page type (not a traffic-mix effect) and "
+                    "should be investigated directly.")
+        elif gained:
+            role = " — it grew its share of already-heavier traffic."
+        else:
+            role = ""
         facts[f"section::{r['segment']}"] = (
             f"{page_token(r['segment'])} moved from {fmt_pct(r['share_normal_pct'])} to "
             f"{fmt_pct(r['share_anomaly_pct'])} of traffic, with its own p75 going from "
-            f"{fmt_ms(r['p75_normal'])} to {fmt_ms(r['p75_anomaly'])}.")
+            f"{fmt_ms(r['p75_normal'])} to {fmt_ms(r['p75_anomaly'])}{role}")
 
     c = findings.get("coverage") or {}
     if c.get("coverage_ratio") is not None:
@@ -1820,7 +1842,7 @@ def build_narrative_facts(findings):
     sev = (findings.get("headline") or {}).get("severity")
     if sev and fl:
         n_sec = len(fl)
-        scope = ("one page section" if n_sec == 1 else f"{n_sec} page sections")
+        scope = ("one page type" if n_sec == 1 else f"{n_sec} page types")
         facts["impact"] = (
             f"Severity is {sev}: the change is statistically significant but confined "
             f"to {scope}, so the rest of the site is unaffected.")
@@ -1853,7 +1875,7 @@ def check_degenerate_comparison(report_text, tol=0.01):
 
 REQUIRED_SECTIONS = ["Executive Summary", "What Changed", "What Did Not Change",
                      "Recommended Actions", "Monitoring Notes"]
-OPTIONAL_SECTIONS = ["Hypotheses", "Page Sections Referenced"]
+OPTIONAL_SECTIONS = ["Hypotheses", "Page Types Referenced"]
 
 
 def report_headings(text):
@@ -2043,24 +2065,13 @@ AKAMAI_PLAYBOOK = [
         "scope_tag": "delivery_ops",
     },
     {
-        "id": "alert_segmentation",
-        "applies_to": ["lcp", "fcp", "ttfb", "tbt"],   # metric-agnostic
-        "when": ["verdict in traffic_mix_shift,multi_segment_mix_shift,"
-                 "mix_shift_with_local_regression,multi_segment_regression"],
-        "levers": ["mPulse alert configuration (page-group / geo dimensions)"],
-        "action": ("Split mPulse alerting by page group and region during "
-                   "campaign periods so composition shifts and genuine "
-                   "regressions are tracked separately, reducing false alarms."),
-        "scope_tag": "monitoring",
-    },
-    {
         "id": "third_party_release_audit",
         "applies_to": ["lcp", "fcp", "ttfb", "tbt"],
         "when": ["within_regression.within_regression == true"],
         "levers": ["Script Management / third-party tag review",
                    "release-change correlation"],
         "action": ("Verify no recent release or third-party tag change landed "
-                   "on the affected section in the anomaly window; compare the "
+                   "on the affected page type in the anomaly window; compare the "
                    "resource waterfall between the two windows."),
         "scope_tag": "app_change",
     },
@@ -2072,7 +2083,7 @@ AKAMAI_PLAYBOOK = [
         "levers": ["Script Management (defer/async non-critical JS)",
                    "EdgeWorkers (offload work from the client)",
                    "third-party tag audit (long tasks)"],
-        "action": ("Reduce main-thread blocking on the affected section: defer or "
+        "action": ("Reduce main-thread blocking on the affected page type: defer or "
                    "split long-running scripts, remove or delay non-critical "
                    "third-party tags, and break up long tasks so the page stays "
                    "responsive."),
@@ -2193,7 +2204,7 @@ Check for these problems:
   session-entry share) described as a driver/cause/root cause.
 - "verdict_conflict": any statement contradicting findings.verdict.sentence.
 - "unsupported_causal_claim": a causal claim not backed by findings.
-- "missing_focus_section": a page section in findings.segments.focus_list not
+- "missing_focus_section": a page type in findings.segments.focus_list not
   mentioned in the report.
 - "missing_required_section": the report omits any of these headings —
   Executive Summary, What Changed, What Did Not Change, Recommended Actions,
@@ -2501,6 +2512,17 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         focus_composition=focus_breakdown(
             focus_df, ["paidmedia", "mem_bucket", "country", "connectiontype", "deviceType"],
             float(focus["p75_normal"]), TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
+        # v6.9.3: align the focus section's example URL with the growth story. If
+        # the breakdown pins the growth to a country, cite a URL from THAT country
+        # in the anomaly window rather than the overall most-frequent one (which
+        # can be a different region than the one the report calls out).
+        _top_country = next((b["segment"] for b in focus_composition if b["dim"] == "country"), None)
+        if _top_country and "url" in focus_df and "country" in focus_df:
+            _sub = focus_df[(focus_df[LABEL_COL] == 1)
+                            & (focus_df["country"].astype(str) == _top_country)]
+            _urls = _sub["url"].dropna().astype(str).map(lambda u: u.split("?")[0])
+            if len(_urls):
+                PAGE_GROUP_URLS[focus["segment"]] = _urls.value_counts().index[0]
 
     print(f"\nfocus sections ({len(focus_list)}):")
     for r in focus_list:
