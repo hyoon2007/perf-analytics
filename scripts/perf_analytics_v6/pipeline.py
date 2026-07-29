@@ -388,12 +388,25 @@ def mem_bucket(v):
     return "low(<=2GB)" if m <= 2 else "mid(4GB)" if m <= 4 else "high(>=8GB)"
 
 
+def rtt_bucket(v):
+    """Coarse network round-trip-time buckets — a network-quality axis for the
+    decomposition and breakdown (a shift toward high-latency users is a
+    composition effect, not a page slowdown)."""
+    try:
+        r = float(v)
+    except (TypeError, ValueError):
+        return "na"
+    return "rtt<=0" if r <= 0 else "rtt 1-50" if r <= 50 else "rtt 51-150" if r <= 150 else "rtt>150"
+
+
 _BREAKDOWN_LABELS = {
     "paidmedia": {"True": "paid-media (ad) entries", "False": "non-paid entries"},
     "connectiontype": {"Cellular": "cellular connections", "Cable/DSL": "cable/DSL connections",
                        "Corporate": "corporate networks", "": "unknown-connection traffic"},
     "mem_bucket": {"low(<=2GB)": "low-memory (<=2GB) devices", "mid(4GB)": "4GB-memory devices",
                    "high(>=8GB)": "high-memory (>=8GB) devices"},
+    "rtt_bucket": {"rtt<=0": "near-zero-RTT connections", "rtt 1-50": "low-latency (1-50ms RTT) users",
+                   "rtt 51-150": "mid-latency (51-150ms RTT) users", "rtt>150": "high-latency (>150ms RTT) users"},
     "deviceType": {"Mobile": "mobile devices", "Desktop": "desktop devices", "Tablet": "tablets"},
 }
 
@@ -401,6 +414,8 @@ _BREAKDOWN_LABELS = {
 def _breakdown_label(dim, seg):
     if dim == "country":
         return humanize_region(seg)
+    if dim == "isp":
+        return f"{seg} network"
     return _BREAKDOWN_LABELS.get(dim, {}).get(str(seg), str(seg))
 
 
@@ -431,23 +446,111 @@ def focus_breakdown(focus_df, dims, focus_p75_normal, timer_col="timer",
     return cands[:top]
 
 
+def robust_decomp(df, base_key, extra_dims, q=0.75, timer_col="timer",
+                  label_col="label", min_support=85.0):
+    """Interacted-cell DFL decomposition that controls for MORE environment axes
+    (connection type, RTT, ...) when it can do so reliably. Adding dimensions
+    reduces omitted-composition bias but makes cells sparser; below `min_support`
+    (fraction of anomaly traffic that has a normal-window counterpart) the split
+    becomes unreliable, so extra dims are dropped one at a time — least-priority
+    first (pass `extra_dims` in priority order) — until support recovers, falling
+    back to `base_key` only. Returns the decomposition dict plus `_key_used`."""
+    extra = [d for d in extra_dims if d in df]
+    for k in range(len(extra), -1, -1):
+        key = list(base_key) + extra[:k]
+        dec = quantile_decomposition(df, key, q=q, timer_col=timer_col, label_col=label_col)
+        if k == 0 or dec["common_support_pct"] >= min_support:
+            dec["_key_used"] = key
+            return dec
+    dec = quantile_decomposition(df, list(base_key), q=q, timer_col=timer_col, label_col=label_col)
+    dec["_key_used"] = list(base_key)
+    return dec
+
+
+ENV_EXTRA_DIMS = ["connectiontype", "rtt_bucket"]   # priority order; dropped last-first
+
+
 def focus_regression_split(focus_df, timer_col="timer", label_col="label",
-                           dims=("country", "mem_bucket", "paidmedia"), abs_floor_ms=50):
+                           base_dims=("country", "mem_bucket", "paidmedia"),
+                           extra_dims=ENV_EXTRA_DIMS, abs_floor_ms=50, min_support=85.0):
     """Split a focus page type's OWN p75 change into (a) a shift in its internal
-    traffic mix (more India / low-memory / paid traffic inside it) vs (b) a
-    genuine same-audience slowdown, using the interacted-cell DFL decomposition
-    on the section's own rows. Returns the two effects and a `genuine_regression`
-    flag that is True only when the genuine part is BOTH material AND the larger
-    of the two — so a rise driven mostly by an internal mix shift is not labelled
+    traffic mix (more India / low-memory / paid / high-latency traffic inside it)
+    vs (b) a genuine same-audience slowdown, via the environment-controlled DFL
+    decomposition. `genuine_regression` is True only when the genuine part is BOTH
+    material AND the larger of the two — so a rise driven mostly by an internal
+    mix shift (including a shift toward slow-network/ISP users) is not labelled
     'the page slowed on its own'."""
-    key = [d for d in dims if d in focus_df]
-    if not key or (focus_df[label_col] == 1).sum() == 0 or (focus_df[label_col] == 0).sum() == 0:
+    base = [d for d in base_dims if d in focus_df]
+    if not base or (focus_df[label_col] == 1).sum() == 0 or (focus_df[label_col] == 0).sum() == 0:
         return {"mix_effect_ms": 0.0, "within_effect_ms": 0.0, "genuine_regression": False}
-    dec = quantile_decomposition(focus_df, key, q=0.75, timer_col=timer_col, label_col=label_col)
+    dec = robust_decomp(focus_df, base, extra_dims, q=0.75, timer_col=timer_col,
+                        label_col=label_col, min_support=min_support)
     mat = effect_materiality(dec, abs_floor_ms=abs_floor_ms)
     within, mix = dec["within_effect_ms"], dec["mix_effect_ms"]
     return {"mix_effect_ms": mix, "within_effect_ms": within,
+            "common_support_pct": dec.get("common_support_pct"),
             "genuine_regression": bool(mat.get("within_material") and within >= mix)}
+
+
+def resource_probe(seg_df, metrics, label_col="label", rel_floor=0.15):
+    """For a genuinely-regressed page type, did the PAGE get heavier (more bytes /
+    requests) — pointing to a content/third-party change — or stay the same weight
+    (an execution/infra-side slowdown)? Reports each metric's normal vs anomaly
+    median and % change; `heavier` is True if any metric rose past `rel_floor`."""
+    out, heavier = {}, False
+    n_rows = seg_df[seg_df[label_col] == 0]
+    a_rows = seg_df[seg_df[label_col] == 1]
+    for m in metrics:
+        if m not in seg_df:
+            continue
+        n = n_rows[m].median()
+        a = a_rows[m].median()
+        if n is None or a is None or (isinstance(n, float) and np.isnan(n)) or (isinstance(a, float) and np.isnan(a)):
+            continue
+        delta_pct = (a - n) / n * 100 if n else 0.0
+        out[m] = {"normal_median": round(float(n), 1), "anomaly_median": round(float(a), 1),
+                  "delta_pct": round(delta_pct, 1)}
+        if n and (a - n) / n >= rel_floor:
+            heavier = True
+    out["heavier"] = heavier
+    return out
+
+
+def new_segment_probe(df, dims, timer_col="timer", label_col="label",
+                      min_normal_n=150, min_anom_share=3.0, surge_ratio=5.0):
+    """Detect NEW or SURGING environment segments — traffic the DFL decomposition
+    cannot handle because it has little or no normal-window baseline to reweight
+    against (e.g. a cloud-ISP burst). A segment qualifies when it is material in
+    the anomaly window (share >= min_anom_share) AND either under-baselined
+    (normal count < min_normal_n) or surged (anomaly share >= surge_ratio x normal
+    share). These are surfaced by NAME, since their impact would otherwise leak
+    into the 'genuine slowdown' bucket."""
+    Nn = int((df[label_col] == 0).sum())
+    Na = int((df[label_col] == 1).sum())
+    if Nn == 0 or Na == 0:
+        return []
+    hits = []
+    for dim in dims:
+        if dim not in df:
+            continue
+        for val, sub in df.groupby(dim, dropna=False):
+            c0 = int((sub[label_col] == 0).sum())
+            c1 = int((sub[label_col] == 1).sum())
+            a_share = c1 / Na * 100
+            n_share = c0 / Nn * 100
+            if a_share < min_anom_share:
+                continue
+            surged = (c0 < min_normal_n) or (n_share == 0) or (n_share > 0 and a_share / n_share >= surge_ratio)
+            if not surged:
+                continue
+            p75a = float(sub.loc[sub[label_col] == 1, timer_col].quantile(.75)) if c1 else None
+            hits.append({"dim": dim, "segment": str(val),
+                         "human_label": _breakdown_label(dim, val),
+                         "normal_share_pct": round(n_share, 2), "anomaly_share_pct": round(a_share, 2),
+                         "normal_count": c0, "p75_anomaly": round(p75a, 1) if p75a is not None else None,
+                         "share_delta_pp": round(a_share - n_share, 2)})
+    hits.sort(key=lambda x: -x["share_delta_pp"])
+    return hits[:4]
 
 
 # ============================ v4 additions ============================
@@ -633,6 +736,7 @@ METRIC_ALIASES = {
 METRIC_PROFILES = {
     "lcp": {
         "display_name": "Largest Contentful Paint",
+        "resource_focus": ["bodysize", "transferbyte", "requestcount"],
         "abbrev": "LCP", "unit": "ms", "unit_kind": "duration",
         "good_ms": 2500, "poor_ms": 4000,
         "artifact_ms": 60_000,          # background-tab beacons
@@ -643,6 +747,7 @@ METRIC_PROFILES = {
     },
     "fcp": {
         "display_name": "First Contentful Paint",
+        "resource_focus": ["bodysize", "transferbyte", "requestcount"],
         "abbrev": "FCP", "unit": "ms", "unit_kind": "duration",
         "good_ms": 1800, "poor_ms": 3000,
         "artifact_ms": 60_000,
@@ -653,6 +758,7 @@ METRIC_PROFILES = {
     },
     "tbt": {
         "display_name": "Total Blocking Time",
+        "resource_focus": ["bodysize", "transferbyte", "requestcount"],
         "abbrev": "TBT", "unit": "ms", "unit_kind": "duration",
         "good_ms": 200, "poor_ms": 600,
         "artifact_ms": 30_000,          # blocking time can't plausibly be minutes
@@ -663,6 +769,7 @@ METRIC_PROFILES = {
     },
     "ttfb": {
         "display_name": "Waiting Time (Time to First Byte)",
+        "resource_focus": [],
         "abbrev": "TTFB", "unit": "ms", "unit_kind": "duration",
         "good_ms": 800, "poor_ms": 1800,
         "artifact_ms": 60_000,
@@ -674,6 +781,7 @@ METRIC_PROFILES = {
     },
     "_generic": {
         "display_name": "Timer", "abbrev": "TIMER", "unit": "ms",
+        "resource_focus": [],
         "unit_kind": "duration", "good_ms": None, "poor_ms": None,
         "artifact_ms": 60_000, "severity_floor_ms": 100, "effect_floor_ms": 50,
         "higher_is_worse": True, "hero_element": False,
@@ -1838,6 +1946,38 @@ def build_narrative_facts(findings):
             f"{fmt_pct(r['share_anomaly_pct'])} of traffic, with its own p75 going from "
             f"{fmt_ms(r['p75_normal'])} to {fmt_ms(r['p75_anomaly'])}{role}")
 
+    # v6.9.5: for a genuinely-regressed page type, did the PAGE get heavier
+    # (content/third-party) or stay the same weight (execution/infra)?
+    for r in (findings.get("segments", {}).get("focus_list") or []):
+        rp = r.get("resource_probe")
+        if not (r.get("genuine_regression") and rp):
+            continue
+        rc = rp.get("requestcount")
+        rc_txt = (f" (request count {fmt_num(rc['normal_median'])} to {fmt_num(rc['anomaly_median'])})"
+                  if rc else "")
+        if rp.get("heavier"):
+            facts[f"resource::{r['segment']}"] = (
+                f"{page_token(r['segment'])} also got heavier in the anomaly window{rc_txt} — a "
+                f"content or third-party change is the likely cause; compare the resource waterfall "
+                f"between the two windows.")
+        else:
+            facts[f"resource::{r['segment']}"] = (
+                f"{page_token(r['segment'])} carried essentially the same page weight{rc_txt}, so "
+                f"its slowdown points to execution/infrastructure (main-thread work or third-party "
+                f"scripts), not added page content.")
+
+    # v6.9.5: a new / surging traffic segment with no baseline (e.g. a cloud-ISP
+    # burst) — its impact can be mistaken for a per-page slowdown.
+    ns = findings.get("new_segments") or []
+    if ns:
+        top = ns[0]
+        more = f", plus {len(ns) - 1} other new segment(s)" if len(ns) > 1 else ""
+        facts["new_segment"] = (
+            f"A new or surging traffic segment appeared with little baseline: {top['human_label']} "
+            f"went from {fmt_pct(top['normal_share_pct'])} to {fmt_pct(top['anomaly_share_pct'])} of "
+            f"traffic{more}. New traffic has no normal-window comparison, so its (often heavier) load "
+            f"can be mistaken for a page slowdown — verify whether this influx is expected.")
+
     c = findings.get("coverage") or {}
     if c.get("coverage_ratio") is not None:
         # v6.7: "account for 178.0ms of the 174.0ms change" read like a typo.
@@ -1963,9 +2103,12 @@ def build_section_facts(findings):
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
-    for key in ("focus_growth", "decomposition", "audience", "client_side", "coverage"):
+    for key in ("focus_growth", "new_segment", "decomposition", "audience", "client_side", "coverage"):
         if key in flat:
             sec["What Changed"].append(flat[key])
+    for key, sentence in flat.items():
+        if key.startswith("resource::"):
+            sec["What Changed"].append(sentence)
 
     if "monitoring" in flat:
         sec["Monitoring Notes"] = [flat["monitoring"]]
@@ -2441,6 +2584,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     df["page_group"] = derive_page_group(df["url"]) if "url" in df else "all"
     df["referrer_present"] = df["referrer"].notna() if "referrer" in df else False
     df["mem_bucket"] = df["deviceMemory"].map(mem_bucket) if "deviceMemory" in df else "na"
+    df["rtt_bucket"] = df["rtt"].map(rtt_bucket) if "rtt" in df else "na"
 
     # ---- representative URL per page group, so the report can cite a concrete
     #      example page instead of only an abstract group name.
@@ -2503,9 +2647,11 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # paid-media) so a composition shift toward heavier sub-segments (e.g. more
     # paid / low-memory traffic within a page group) is counted as MIX, not
     # misattributed to a genuine per-section slowdown (WITHIN).
-    _decomp_key = [PRIMARY_DIM] + [c for c in ("mem_bucket", "paidmedia") if c in df]
-    p75_decomp = quantile_decomposition(df, _decomp_key, q=0.75, timer_col=TIMER_COL,
-                                        label_col=LABEL_COL)
+    # v6.9.5: also control network environment (connection type, RTT) via a
+    # common-support guard, so a shift toward slow-network users reads as MIX.
+    _decomp_base = [PRIMARY_DIM] + [c for c in ("mem_bucket", "paidmedia") if c in df]
+    p75_decomp = robust_decomp(df, _decomp_base, ENV_EXTRA_DIMS, q=0.75,
+                               timer_col=TIMER_COL, label_col=LABEL_COL)
     materiality = effect_materiality(p75_decomp, abs_floor_ms=EFFECT_FLOOR_MS)
     print(f"[p75 decomposition] Δ{p75_decomp['total_delta_ms']}ms = "
           f"mix {p75_decomp['mix_effect_ms']:+} + within {p75_decomp['within_effect_ms']:+} "
@@ -2536,7 +2682,8 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
             drilldown[d]=top_movers(focus_df, d, TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
         # v6.9.2: which audience/device sub-segments drove the focus section's rise
         focus_composition=focus_breakdown(
-            focus_df, ["paidmedia", "mem_bucket", "country", "connectiontype", "deviceType"],
+            focus_df, ["paidmedia", "mem_bucket", "country", "connectiontype",
+                       "deviceType", "isp", "rtt_bucket"],
             float(focus["p75_normal"]), TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
         # v6.9.3: align the focus section's example URL with the growth story. If
         # the breakdown pins the growth to a country, cite a URL from THAT country
@@ -2560,6 +2707,18 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         _r["genuine_regression"] = _split["genuine_regression"]
         _r["subcomp_mix_ms"] = _split["mix_effect_ms"]
         _r["genuine_within_ms"] = _split["within_effect_ms"]
+        # v6.9.5: for a GENUINE regression, probe whether the page got heavier
+        # (content/third-party change) or stayed the same weight (execution/infra).
+        if _r["genuine_regression"] and METRIC_PROFILE.get("resource_focus"):
+            _r["resource_probe"] = resource_probe(_seg_df, METRIC_PROFILE["resource_focus"], LABEL_COL)
+
+    # v6.9.5: NEW / SURGING environment segments (e.g. a cloud-ISP burst) that the
+    # DFL decomposition cannot reweight — surfaced by name so their impact is not
+    # silently read as a per-page genuine slowdown.
+    new_segments = new_segment_probe(df, ["isp", "country", "connectiontype"], TIMER_COL, LABEL_COL)
+    if new_segments:
+        print("new/surging segments:", [(s["dim"], s["segment"],
+              f"{s['normal_share_pct']}->{s['anomaly_share_pct']}%") for s in new_segments])
 
     print(f"\nfocus sections ({len(focus_list)}):")
     for r in focus_list:
@@ -2693,6 +2852,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         "verdict": {"code": verdict_code, "sentence": verdict_sentence},
         "within_regression": within_flags,
         "focus_breakdown": focus_composition,
+        "new_segments": new_segments,
         "segments": {
             "primary_dim": PRIMARY_DIM,
             "primary_share_movers": _label_movers(primary_movers["share_movers"][:5], PRIMARY_DIM),
