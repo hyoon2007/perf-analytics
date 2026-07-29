@@ -228,7 +228,26 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
 >
 > 고객 설명용 시각 문서(구성 vs 자체 분해, 위 예시 포함)는 아티팩트로 별도 제공됨.
 
+### 환경 구성 통제 · 리소스 probe · 신규 세그먼트 (v6.9.5)
+- **환경 통제(A)**: mix/within 분해(사이트 + per-focus)가 `connectiontype`·`rtt_bucket`까지
+  통제합니다. `robust_decomp()`가 확장 셀 키로 계산하되 **공통지지도 < 85%면 그 차원을
+  드롭**(우선순위 낮은 것부터)해 희박-셀 잡음을 막습니다. 그래서 "느린 네트워크/RTT
+  유저로의 이동"도 자체 저하가 아니라 **구성(MIX)**으로 집계됩니다. `focus_breakdown`엔
+  `isp`·`rtt_bucket`도 추가 → 리포트가 *"Jio network 8%→13.3%"* 처럼 명시.
+- **리소스 probe(B)**: 자체 회귀로 판정된 페이지 타입에 `resource_probe()`가 리소스
+  중앙값(normal vs anomaly)을 계산 → **무거워짐**(콘텐츠/서드파티 변경) vs **무게 동일**
+  (실행/인프라)로 방향 제시. 메트릭별 대상: `resource_focus` = TBT/LCP/FCP →
+  `[bodysize, transferbyte, requestcount]`, TTFB → `[]`.
+- **신규/급증 세그먼트(C)**: DFL 분해는 **baseline이 없는 새 트래픽**(예: 클라우드 ISP
+  급증)을 재가중할 수 없어 그 영향이 within으로 샙니다. `new_segment_probe()`가
+  **정상 count < min_n(≈150) OR (이상 share ≥ 3% AND 이상/정상 ≥ 5×)** 인 세그먼트를
+  이름으로 찾아 리포트에 명시 → "새 유입일 뿐 페이지 저하가 아님"을 구분.
+
+> 검증(7-28_1143 TBT): 분해 키가 `connectiontype+rtt_bucket` 채택(support 99.6%),
+> smartphones 성장에 **Jio(ISP)** 표면화, watches 자체 회귀에 *"페이지 무게 동일(요청 수
+> 113→107) → 실행/인프라 측"* 단서 추가. 이 데이터엔 급증 세그먼트 없음(`[]`).
+
 ### 번호 검증과의 관계
-위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown 등)의 값은
-findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한 심각도·client-side 문장은
-**number-free**라 검증·critic·바인딩 체크를 통과합니다.
+위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown·resource·
+new_segments 등)의 값은 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한
+심각도·client-side 문장은 **number-free**라 검증·critic·바인딩 체크를 통과합니다.
