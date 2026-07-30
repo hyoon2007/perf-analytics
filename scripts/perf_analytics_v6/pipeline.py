@@ -1003,7 +1003,15 @@ def select_verdict(severity, decomp_primary, localization, behavior,
     multi=n_focus>=2
     low_cov=bool(coverage and not coverage.get("sufficient"))
 
-    if severity in ("none","info","improved"):
+    if severity == "improved":
+        # v6.9.6: dedicated IMPROVED verdict — the overall metric got BETTER.
+        s=("The overall p75 improved in the anomaly window (it fell). This is a "
+           "traffic-composition effect — lighter page types grew their share while "
+           "heavier ones shrank — so it may reverse when the traffic mix normalizes. "
+           "No action is needed for the overall metric.")
+        return "improved", s
+
+    if severity in ("none","info"):
         s=("No meaningful page-load degradation was found between the two windows.")
         if outlier_note:
             s+=(" A small number of extreme-duration beacons inflate the average; "
@@ -1832,12 +1840,20 @@ def build_narrative_facts(findings):
     # the p75 headline (174 ms) and read like a contradiction.
     d = findings.get("decomposition") or {}
     if d.get("total_delta_ms") is not None:
-        facts["decomposition"] = (
-            f"Of the {fmt_ms(d['total_delta_ms'])} {d.get('stat','p75')} increase, "
-            f"{fmt_ms(d.get('mix_effect_ms', 0))} comes from a shift in traffic "
-            f"composition toward heavier page/device/traffic-type mixes and only "
-            f"{fmt_ms(d.get('within_effect_ms', 0))} from segments genuinely slowing on "
-            f"their own (holding that mix constant).")
+        _tot, _stat = d["total_delta_ms"], d.get("stat", "p75")
+        _mix, _win = d.get("mix_effect_ms", 0), d.get("within_effect_ms", 0)
+        if _tot >= 0:
+            facts["decomposition"] = (
+                f"Of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes from a shift "
+                f"in traffic composition toward heavier page/device/traffic-type mixes and "
+                f"only {fmt_ms(_win)} from segments genuinely slowing on their own (holding "
+                f"that mix constant).")
+        else:
+            # v6.9.6: negative total = improvement; never call it an "increase".
+            facts["decomposition"] = (
+                f"The {_stat} change of {fmt_ms(_tot)} is a net improvement: {fmt_ms(_mix)} "
+                f"of it is a traffic-composition shift toward lighter page/device/traffic-type "
+                f"mixes, and {fmt_ms(_win)} is segments' own change (holding that mix constant).")
 
     # v6.9.1 FIX: only assert a "new-visitor" audience shift when the
     # new_visitor_influx signal actually fired. Previously this sentence was
@@ -2004,9 +2020,11 @@ def build_narrative_facts(findings):
             f"toward {fmt_ms(r0['p75_normal'])}; if the share normalizes but the p75 "
             f"stays near {fmt_ms(r0['p75_anomaly'])}, treat it as a genuine regression.")
 
-    # v6.7: scope/impact line for the executive summary
+    # v6.7: scope/impact line for the executive summary.
+    # v6.9.6: skip for improved/none/info — "Severity is improved: the change is
+    # confined to..." reads as a degradation, which it is not.
     sev = (findings.get("headline") or {}).get("severity")
-    if sev and fl:
+    if sev and fl and sev not in ("improved", "none", "info"):
         n_sec = len(fl)
         scope = ("one page type" if n_sec == 1 else f"{n_sec} page types")
         facts["impact"] = (
@@ -2311,6 +2329,31 @@ def match_playbook(findings, playbook=AKAMAI_PLAYBOOK, metric_key=None):
                              "action": entry["action"],
                              "scope_tag": entry["scope_tag"]})
     return selected
+
+
+def local_regression_actions(findings):
+    """v6.9.6: when the overall metric did NOT degrade (improved / no_action), the
+    degradation playbook must not fire (no delivery/CDN investigation for a metric
+    that got better). The only thing worth acting on is a page type that regressed
+    ON ITS OWN under the overall improvement — build those as the recommendations."""
+    acts = []
+    for r in (findings.get("segments", {}).get("focus_list") or []):
+        if not r.get("genuine_regression"):
+            continue
+        rp = r.get("resource_probe") or {}
+        cause = ("its page weight also rose, so check for a content or third-party change"
+                 if rp.get("heavier") else
+                 "its page weight was unchanged, so the cause is execution-side "
+                 "(main-thread work or third-party scripts)")
+        acts.append({
+            "id": f"local_regression_{r['segment']}",
+            "levers": ["Script Management / third-party tag review", "release-change correlation"],
+            "action": (f"Investigate the '{r['segment']}' page type's own regression: its p75 rose "
+                       f"even though the overall metric improved, and {cause}. Compare the resource "
+                       f"waterfall and recent releases for that page type."),
+            "scope_tag": "app_change",
+        })
+    return acts
 
 
 # ============================================================= HYPOTHESES
@@ -2887,6 +2930,10 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     }
     # v5: attach Akamai-playbook remediation and findings-consistent hypotheses
     findings["remediation_playbook"] = match_playbook(findings, metric_key=METRIC_PROFILE["profile_key"])
+    # v6.9.6: the metric did not degrade -> drop degradation actions (e.g. "investigate
+    # delivery regression"); recommend only a genuine local regression if one exists.
+    if verdict_code in ("improved", "no_action"):
+        findings["remediation_playbook"] = local_regression_actions(findings)
     findings["hypotheses"] = derive_hypotheses(findings)
 
     # v6.1: Python pre-writes every load-bearing sentence so the model never has to
