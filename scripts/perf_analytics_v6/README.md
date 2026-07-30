@@ -247,6 +247,20 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
 > smartphones 성장에 **Jio(ISP)** 표면화, watches 자체 회귀에 *"페이지 무게 동일(요청 수
 > 113→107) → 실행/인프라 측"* 단서 추가. 이 데이터엔 급증 세그먼트 없음(`[]`).
 
+### 개선(improved) 케이스 처리 (v6.9.6)
+전체 p75가 **내려간(개선된)** 경우를 위한 전용 경로:
+- **`improved` verdict 신설**(no_action과 분리): Executive Summary가 *"전체 p75 개선 —
+  가벼운 페이지 유형이 비중↑/무거운 유형↓의 구성 효과, 캠페인 종료 시 원복 가능,
+  전체 지표는 조치 불필요"*로 서술. `impact`("Severity is improved: confined…") 억제.
+- **방향 인지 서술**: `decomposition` 문장이 음수 델타를 "increase"로 쓰던 버그 수정 →
+  *"…is a net improvement: … toward lighter mixes"*. (부호 있는 숫자 유지 → 검증 안전)
+- **권고 로직**: verdict가 improved/no_action이면 **저하용 플레이북(delivery 조사 등) 발화
+  금지**. 대신 `local_regression_actions()`가 **개선에 가려진 국소 회귀**(자체 p75가 오른
+  focus)를 Recommended Actions 최상단으로 승격.
+
+> 검증(7-30_176 TBT, 2,693.5→806, −70%): verdict=improved, delivery=degraded여도
+> delivery 권고 억제, 권고 = *"smartphones 자체 회귀 조사(요청수 163→163=실행부하)"*.
+
 ### 번호 검증과의 관계
 위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown·resource·
 new_segments 등)의 값은 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한
