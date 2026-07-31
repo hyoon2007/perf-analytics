@@ -1407,7 +1407,7 @@ def localize_email(target_lang, subject, plain_md, max_attempts=2):
         cand_s = _translate_once(subject, lang_name).splitlines()
         cand_s = cand_s[0].strip() if cand_s else ""
         cs_nums, _ = _preserved_tokens(cand_s)
-        if cand_s and subj_nums <= cs_nums and "[v6]" in cand_s:
+        if cand_s and subj_nums <= cs_nums:
             subj_out = cand_s
     except Exception as exc:
         print(f"[i18n] subject translation error (keeping English): {exc}")
@@ -1780,6 +1780,24 @@ def numbers_in_text(text):
     return out
 
 
+def _collect_label_literals():
+    """Numeric constants baked into our own descriptive segment labels — RTT and
+    memory bucket boundaries such as "51-150ms RTT" or ">150ms RTT". These are
+    label VOCABULARY, not claimed metric values, so when a bucket label lands in
+    a supplied fact (e.g. focus_growth names the '>150ms RTT' sub-segment that
+    grew) its embedded '150' must not be misread by number-binding as a metric
+    number bound to 'traffic'/'share'. Preapproving them keeps our own text from
+    tripping our own gate — the deadlock that failed the 7-31 LCP/FCP files."""
+    nums = set()
+    for mapping in _BREAKDOWN_LABELS.values():
+        for label in mapping.values():
+            nums |= numbers_in_text(label)
+    return nums
+
+
+LABEL_LITERAL_NUMBERS = _collect_label_literals()
+
+
 def collect_supplied_text(findings):
     """Every string the prompt asks the model to reuse. self-check must cover
     ALL of it: v6.5 checked only narrative_facts, so the localization sentence
@@ -1809,18 +1827,22 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
                 and ("narrative_facts" in findings_or_facts
                      or "section_facts" in findings_or_facts)
                 else dict(findings_or_facts))
+    # bucket-boundary numbers in our own segment labels (e.g. '150' in
+    # '>150ms RTT') are descriptive vocabulary, not metric values — exempt them
+    # from both the binding check and the whitelist check.
+    allowed_with_labels = set(allowed_numbers) | LABEL_LITERAL_NUMBERS
     bugs = []
     for key, sentence in supplied.items():
         if not isinstance(sentence, str):
             continue
-        bad = check_number_binding(sentence, bindings)
+        bad = check_number_binding(sentence, bindings, preapproved=LABEL_LITERAL_NUMBERS)
         if bad:
             bugs.append(f"{key} fails number-binding: {bad}")
         degen = check_degenerate_comparison(sentence)
         if degen:
             bugs.append(f"{key} {degen}")
         unknown = [n for n in numbers_in_text(sentence)
-                   if not any(abs(n - a) <= 0.51 for a in allowed_numbers)]
+                   if not any(abs(n - a) <= 0.51 for a in allowed_with_labels)]
         if unknown:
             bugs.append(f"{key} has numbers outside the whitelist: {unknown}")
     return bugs
@@ -2549,7 +2571,7 @@ def build_llm_prompt_v63(findings_text, section_facts, want_hypotheses):
 
 
 def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
-           timer_metric=None, subject_prefix="[v6] "):
+           timer_metric=None, subject_prefix=""):
     """Run the v6 pipeline on one CSV and return report artifacts.
 
     Returns a dict: report_md, report_source, email_subject, email_plain,
@@ -2993,7 +3015,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         raw_feat   = [d_["feature"] for d_ in findings["performance_drivers"] if d_["feature"] in cand]
         causal_bad = check_causal_misuse_v6(cand, symptom_labels)
         scope_bad  = check_recommendation_scope(cand, playbook_actions)
-        bind_bad   = check_number_binding(cand, metric_bindings)
+        bind_bad   = check_number_binding(cand, metric_bindings, preapproved=LABEL_LITERAL_NUMBERS)
         degen_bad  = check_degenerate_comparison(cand)
         url_missing= verify_urls_present(cand, PAGE_GROUP_URLS, focus_segments)
         structure  = has_required_structure(cand)

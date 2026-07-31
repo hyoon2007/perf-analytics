@@ -20,6 +20,7 @@ Durability (v6.9.3):
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,11 @@ VALID_EXTS = (".csv",)
 SCRIPT_DIR = Path(__file__).resolve().parent
 V6_RUNNER = SCRIPT_DIR / "run_v6_report.py"
 V1_RUNNER = SCRIPT_DIR / "run_timerweight_report.py"
+
+# v1 (legacy XGBoost/SHAP pipeline) is DISABLED — v6 is now the sole production
+# pipeline. The parallel-comparison period is over. Set V1_ENABLED=1 in the
+# environment to re-enable the best-effort v1 run for a future comparison.
+V1_ENABLED = os.getenv("V1_ENABLED", "0") == "1"
 
 
 def _state_path(cfg: AppConfig) -> Path:
@@ -120,10 +126,12 @@ def _process_new_file(filename: str, cfg: AppConfig, cfg_path: str,
     seen.add(filename)
     _persist_seen(state_path, seen)
 
-    # 3) v1 (best-effort — its outcome never blocks the file lifecycle)
-    v1_rc = _run_runner(V1_RUNNER, name, cfg_path, "v1", extra_args)
-    if v1_rc != 0:
-        print(f"[MONITOR] v1 returned {v1_rc} (best-effort; not blocking) for {name}")
+    # 3) v1 (DISABLED by default; best-effort — its outcome never blocks the
+    #    file lifecycle). Re-enable with V1_ENABLED=1 for a comparison run.
+    if V1_ENABLED:
+        v1_rc = _run_runner(V1_RUNNER, name, cfg_path, "v1", extra_args)
+        if v1_rc != 0:
+            print(f"[MONITOR] v1 returned {v1_rc} (best-effort; not blocking) for {name}")
 
     # 4) file lifecycle keyed on v6 outcome
     dest_dir = cfg.processed_dir if v6_rc == 0 else cfg.failed_dir
@@ -168,7 +176,8 @@ def main() -> int:
 
     print(f"[MONITOR] FTP host  : {cfg.ftp_host}/{cfg.ftp_remote_dir}")
     print(f"[MONITOR] Poll every: {args.interval}s")
-    print(f"[MONITOR] Runners   : v6={V6_RUNNER.name}, v1={V1_RUNNER.name} (v6 first, v1 best-effort)")
+    _v1_state = f"v1={V1_RUNNER.name} best-effort" if V1_ENABLED else "v1 DISABLED"
+    print(f"[MONITOR] Runners   : v6={V6_RUNNER.name} ({_v1_state})")
     print(f"[MONITOR] State file: {state_path}")
 
     seen = _load_seen(state_path)

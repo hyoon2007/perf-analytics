@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", choices=["local", "ftp"], default="local", help="Input source type.")
     parser.add_argument("--config", default="/opt/perf-analytics/config/ops_pipeline.conf", help="Path to ops config file.")
     parser.add_argument("--sec-dir", default=None, help="Secrets dir (default: <base_data_dir>/.sec).")
-    parser.add_argument("--subject-prefix", default="[v6] ", help="Email subject prefix tag.")
+    parser.add_argument("--subject-prefix", default="", help="Email subject prefix tag (empty = no tag).")
     parser.add_argument("--skip-email", action="store_true", help="Skip SES email send.")
     parser.add_argument("--no-move", action="store_true", help="Do not move the CSV after processing (caller owns it).")
     return parser.parse_args()
