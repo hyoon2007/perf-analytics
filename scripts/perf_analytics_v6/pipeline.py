@@ -492,12 +492,30 @@ def focus_regression_split(focus_df, timer_col="timer", label_col="label",
             "genuine_regression": bool(mat.get("within_material") and within >= mix)}
 
 
-def resource_probe(seg_df, metrics, label_col="label", rel_floor=0.15):
+# Per-metric "got heavier" thresholds for a NAMED page type. Request count moves
+# in coarse whole-request steps, so a smaller relative move is already meaningful
+# (5%); byte-weight metrics are noisier run-to-run, so they need a larger move
+# (10%) before we call the page genuinely heavier. The catch-all 'other' bucket
+# blends many page types, making its resource medians unreliable, so it keeps the
+# stricter uniform RESOURCE_FLOOR_OTHER instead of these per-metric floors.
+RESOURCE_FLOORS = {"requestcount": 0.05, "bodysize": 0.10, "transferbyte": 0.10}
+RESOURCE_FLOOR_OTHER = 0.15
+
+_RESOURCE_LABELS = {"requestcount": "request count",
+                    "bodysize": "page weight (bytes)",
+                    "transferbyte": "bytes transferred"}
+
+
+def resource_probe(seg_df, metrics, label_col="label", rel_floor=0.15, floors=None):
     """For a genuinely-regressed page type, did the PAGE get heavier (more bytes /
     requests) — pointing to a content/third-party change — or stay the same weight
     (an execution/infra-side slowdown)? Reports each metric's normal vs anomaly
-    median and % change; `heavier` is True if any metric rose past `rel_floor`."""
-    out, heavier = {}, False
+    median and % change. A metric counts as heavier when it rises past its own
+    floor (per-metric via `floors`, else the uniform `rel_floor`); `heavier` is
+    True if ANY metric crossed, and `exceeded` lists EVERY metric that did so the
+    report can name all of them, not just one."""
+    floors = floors or {}
+    out, heavier, exceeded = {}, False, []
     n_rows = seg_df[seg_df[label_col] == 0]
     a_rows = seg_df[seg_df[label_col] == 1]
     for m in metrics:
@@ -508,12 +526,31 @@ def resource_probe(seg_df, metrics, label_col="label", rel_floor=0.15):
         if n is None or a is None or (isinstance(n, float) and np.isnan(n)) or (isinstance(a, float) and np.isnan(a)):
             continue
         delta_pct = (a - n) / n * 100 if n else 0.0
+        thr = floors.get(m, rel_floor)
+        crossed = bool(n and (a - n) / n >= thr)
         out[m] = {"normal_median": round(float(n), 1), "anomaly_median": round(float(a), 1),
-                  "delta_pct": round(delta_pct, 1)}
-        if n and (a - n) / n >= rel_floor:
+                  "delta_pct": round(delta_pct, 1), "floor_pct": round(thr * 100, 1),
+                  "exceeded": crossed}
+        if crossed:
             heavier = True
+            exceeded.append(m)
     out["heavier"] = heavier
+    out["exceeded"] = exceeded
     return out
+
+
+def resource_change_phrase(rp, metrics):
+    """Readable 'metric N to M (+X%)' clause for the given metrics, using the
+    medians/percentages resource_probe already put in findings (so every number is
+    whitelisted). Used to name ALL threshold-crossing resource metrics."""
+    parts = []
+    for m in metrics:
+        d = rp.get(m)
+        if not d:
+            continue
+        parts.append(f"{_RESOURCE_LABELS.get(m, m)} {fmt_num(d['normal_median'])} to "
+                     f"{fmt_num(d['anomaly_median'])} ({d['delta_pct']:+}%)")
+    return "; ".join(parts)
 
 
 def new_segment_probe(df, dims, timer_col="timer", label_col="label",
@@ -1994,10 +2031,12 @@ def build_narrative_facts(findings):
         rc_txt = (f" (request count {fmt_num(rc['normal_median'])} to {fmt_num(rc['anomaly_median'])})"
                   if rc else "")
         if rp.get("heavier"):
+            exceeded = rp.get("exceeded") or []
+            detail = resource_change_phrase(rp, exceeded)
             facts[f"resource::{r['segment']}"] = (
-                f"{page_token(r['segment'])} also got heavier in the anomaly window{rc_txt} — a "
-                f"content or third-party change is the likely cause; compare the resource waterfall "
-                f"between the two windows.")
+                f"{page_token(r['segment'])} also got heavier in the anomaly window — {detail} "
+                f"crossed the change threshold, so a content or third-party change is the likely "
+                f"cause; compare the resource waterfall between the two windows.")
         else:
             facts[f"resource::{r['segment']}"] = (
                 f"{page_token(r['segment'])} carried essentially the same page weight{rc_txt}, so "
@@ -2363,10 +2402,13 @@ def local_regression_actions(findings):
         if not r.get("genuine_regression"):
             continue
         rp = r.get("resource_probe") or {}
-        cause = ("its page weight also rose, so check for a content or third-party change"
-                 if rp.get("heavier") else
-                 "its page weight was unchanged, so the cause is execution-side "
-                 "(main-thread work or third-party scripts)")
+        if rp.get("heavier"):
+            detail = resource_change_phrase(rp, rp.get("exceeded") or [])
+            cause = (f"its page weight also rose ({detail}), so check for a content or "
+                     f"third-party change")
+        else:
+            cause = ("its page weight was unchanged, so the cause is execution-side "
+                     "(main-thread work or third-party scripts)")
         acts.append({
             "id": f"local_regression_{r['segment']}",
             "levers": ["Script Management / third-party tag review", "release-change correlation"],
@@ -2775,7 +2817,13 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         # v6.9.5: for a GENUINE regression, probe whether the page got heavier
         # (content/third-party change) or stayed the same weight (execution/infra).
         if _r["genuine_regression"] and METRIC_PROFILE.get("resource_focus"):
-            _r["resource_probe"] = resource_probe(_seg_df, METRIC_PROFILE["resource_focus"], LABEL_COL)
+            # named page types use the per-metric floors (requestcount 5%,
+            # byte-weight 10%); the heterogeneous 'other' bucket keeps the
+            # stricter uniform floor to avoid false 'got heavier' calls.
+            _floors = None if _r["segment"] == "other" else RESOURCE_FLOORS
+            _r["resource_probe"] = resource_probe(
+                _seg_df, METRIC_PROFILE["resource_focus"], LABEL_COL,
+                rel_floor=RESOURCE_FLOOR_OTHER, floors=_floors)
 
     # v6.9.5: NEW / SURGING environment segments (e.g. a cloud-ISP burst) that the
     # DFL decomposition cannot reweight — surfaced by name so their impact is not
