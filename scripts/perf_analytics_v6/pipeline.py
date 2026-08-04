@@ -1115,9 +1115,9 @@ def select_verdict(severity, decomp_primary, localization, behavior,
            "or per-section effect dominating.")
 
     if low_cov:
-        s+=(f" Note: the identified sections explain only "
-            f"{int(round(coverage['coverage_ratio']*100))}% of the p75 change; a "
-            f"further contributor remains unaccounted for.")
+        s+=(f" Note: at the page-type level the identified sections localise only "
+            f"{int(round(coverage['coverage_ratio']*100))}% of the p75 change; the rest is a "
+            f"broad shift spread across many smaller page types, not a single missing section.")
     return code, s
 
 
@@ -1238,10 +1238,11 @@ def render_fallback_report(f):
                      f"{fmt_pct(b['anomaly']['client_cacherate_median'])}")
     cov=f.get("coverage")
     if cov and not cov.get("sufficient"):
-        lines.append(f"- Coverage note: the sections above explain "
+        lines.append(f"- Coverage note: at the page-type level the sections above localise "
                      f"{int(round(cov['coverage_ratio']*100))}% of the p75 change "
                      f"({fmt_ms(cov['explained_p75_delta'])} of {fmt_ms(cov['overall_p75_delta'])}); "
-                     f"a further contributor remains unaccounted for.")
+                     f"the rest is broadly distributed across smaller page types, not a single "
+                     f"missing section.")
     ob=f.get("other_watch")
     if ob and ob.get("flagged"):
         lines.append(f"- The catch-all 'other' bucket also degraded "
@@ -1298,7 +1299,7 @@ def render_fallback_report(f):
     for a in actions.get(v["code"], actions["no_action"]):
         lines.append(f"- {a}")
     if cov and not cov.get("sufficient"):
-        lines.append("- Widen the tracked page-group set (increase top_k) or analyze another dimension; the current sections do not fully explain the change.")
+        lines.append("- The change is broadly distributed beyond the named page types; widen the tracked page-group set (increase top_k) or analyze another dimension (country/network/device) to localise it.")
     lines.append("")
     lines.append("## Monitoring Notes")
     mon = (f.get("narrative_facts") or {}).get("monitoring")
@@ -1925,16 +1926,31 @@ def build_narrative_facts(findings):
         _mix, _win = d.get("mix_effect_ms", 0), d.get("within_effect_ms", 0)
         if _tot >= 0:
             facts["decomposition"] = (
-                f"Of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes from a shift "
-                f"in traffic composition toward heavier page/device/traffic-type mixes and "
-                f"only {fmt_ms(_win)} from segments genuinely slowing on their own (holding "
-                f"that mix constant).")
+                f"Across all traffic, of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes "
+                f"from a shift in traffic composition toward heavier page/device/traffic-type mixes "
+                f"and only {fmt_ms(_win)} from segments genuinely slowing on their own (holding that "
+                f"mix constant); these two components add up to the whole change.")
         else:
             # v6.9.6: negative total = improvement; never call it an "increase".
             facts["decomposition"] = (
-                f"The {_stat} change of {fmt_ms(_tot)} is a net improvement: {fmt_ms(_mix)} "
-                f"of it is a traffic-composition shift toward lighter page/device/traffic-type "
-                f"mixes, and {fmt_ms(_win)} is segments' own change (holding that mix constant).")
+                f"Across all traffic, the {_stat} change of {fmt_ms(_tot)} is a net improvement: "
+                f"{fmt_ms(_mix)} of it is a traffic-composition shift toward lighter "
+                f"page/device/traffic-type mixes, and {fmt_ms(_win)} is segments' own change "
+                f"(holding that mix constant); these two components add up to the whole change.")
+        # v6.9.8: surface the reweighting's common support so the split's
+        # reliability is visible. A low value means much anomaly traffic has no
+        # matching normal-window segment to reweight against, weakening the split.
+        _supp = d.get("common_support_pct")
+        if _supp is not None:
+            if _supp >= 90:
+                facts["decomposition_support"] = (
+                    f"This split is well-supported: {fmt_pct(_supp)} of anomaly-window records have a "
+                    f"matching normal-window segment to reweight against.")
+            else:
+                facts["decomposition_support"] = (
+                    f"Read this split with caution: only {fmt_pct(_supp)} of anomaly-window records "
+                    f"have a matching normal-window segment to reweight against, so part of the change "
+                    f"cannot be cleanly split into mix vs own change.")
 
     # v6.9.1 FIX: only assert a "new-visitor" audience shift when the
     # new_visitor_influx signal actually fired. Previously this sentence was
@@ -2079,19 +2095,30 @@ def build_narrative_facts(findings):
 
     c = findings.get("coverage") or {}
     if c.get("coverage_ratio") is not None:
-        # v6.7: "account for 178.0ms of the 174.0ms change" read like a typo.
-        # State it via the residual, which is what the reader actually needs.
+        # v6.9.8: coverage is a page-TYPE-level lens (leave-out of the identified
+        # page types), DISTINCT from the all-traffic mix/within split above. When
+        # it is low the remainder is NOT "unexplained" — the mix/within split
+        # already accounts for the whole change; it is simply a broad shift the
+        # page-type view cannot localise. Say that, instead of "unaccounted for".
         residual = c.get("residual_p75_delta")
-        if c.get("coverage_ratio", 0) >= 0.95 and residual is not None:
+        cov_ratio = c.get("coverage_ratio", 0)
+        if cov_ratio >= 0.95 and residual is not None:
             facts["coverage"] = (
-                f"Removing those sections leaves the rest of the site essentially "
-                f"flat (residual p75 change of {fmt_ms(residual)}), so they account "
-                f"for the whole p75 shift.")
+                f"At the page-type level, removing the identified page types leaves the rest of the "
+                f"site essentially flat (residual p75 change of {fmt_ms(residual)}), so they localise "
+                f"essentially the whole p75 shift.")
+        elif cov_ratio >= 0.70:
+            facts["coverage"] = (
+                f"At the page-type level, the identified page types account for "
+                f"{fmt_ms(c['explained_p75_delta'])} of the {fmt_ms(c['overall_p75_delta'])} p75 "
+                f"change; the remaining {fmt_ms(residual)} is spread across other, smaller page types.")
         else:
             facts["coverage"] = (
-                f"Those sections explain {fmt_ms(c['explained_p75_delta'])} of the "
-                f"{fmt_ms(c['overall_p75_delta'])} p75 change, leaving "
-                f"{fmt_ms(residual)} unaccounted for.")
+                f"The named page types localise only {fmt_ms(c['explained_p75_delta'])} of the "
+                f"{fmt_ms(c['overall_p75_delta'])} p75 change at the page-type level; the larger "
+                f"remaining {fmt_ms(residual)} is not a single missing section but a broad shift "
+                f"across many smaller page types and finer sub-segments (country, network, device) — "
+                f"consistent with the composition split above.")
 
     # v6.7: concrete resolution criteria instead of generic monitoring advice
     fl = findings.get("segments", {}).get("focus_list") or []
@@ -2204,7 +2231,8 @@ def build_section_facts(findings):
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
-    for key in ("focus_growth", "new_segment", "decomposition", "audience", "client_side", "coverage"):
+    for key in ("focus_growth", "new_segment", "decomposition", "decomposition_support",
+                "audience", "client_side", "coverage"):
         if key in flat:
             sec["What Changed"].append(flat[key])
     for key, sentence in flat.items():
@@ -2485,9 +2513,10 @@ def derive_hypotheses(findings):
                     "load time independently of the traffic shift.")
     cov = findings.get("coverage")
     if cov and not cov.get("sufficient"):
-        hyps.append("Part of the change originates outside the identified "
-                    "sections; a broader release or a page group beyond the "
-                    "tracked set may contribute.")
+        hyps.append("Most of the change is broadly distributed rather than "
+                    "localised to the named page types — a wide composition shift "
+                    "(or a release touching many page types) is the likely driver; "
+                    "verify against release timing.")
     return hyps
 
 
@@ -2797,8 +2826,12 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     focus=focus_list[0] if focus_list else None          # primary, for localization/behavior drill
     focus_segments=[r["segment"] for r in focus_list]
 
-    # coverage: do the chosen sections actually explain the sitewide p75 rise?
-    coverage=coverage_check(df, PRIMARY_DIM, focus_segments, TIMER_COL, LABEL_COL) if focus_segments else None
+    # coverage: do the identified page types explain the sitewide p75 shift?
+    # v6.9.8: remove headline focus AND demoted additional_segments, so a mover
+    # that was demoted (materiality gate) is not miscounted as unexplained.
+    _cov_segments = focus_segments + [s for s in (focus_selection.get("additional_segments") or [])
+                                      if s not in focus_segments]
+    coverage=coverage_check(df, PRIMARY_DIM, _cov_segments, TIMER_COL, LABEL_COL) if focus_segments else None
     other_watch=other_bucket_watch(primary_movers)
 
     localization, drilldown = None, {}
