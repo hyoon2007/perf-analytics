@@ -238,6 +238,15 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
   중앙값(normal vs anomaly)을 계산 → **무거워짐**(콘텐츠/서드파티 변경) vs **무게 동일**
   (실행/인프라)로 방향 제시. 메트릭별 대상: `resource_focus` = TBT/LCP/FCP →
   `[bodysize, transferbyte, requestcount]`, TTFB → `[]`.
+  - **지표별 임계치(v6.9.7)**: 이름 있는 page type은 `requestcount 5% · bodysize·
+    transferbyte 10%`(`RESOURCE_FLOORS`)를 적용. 요청 수는 정수 단위로 움직여 작은
+    상대변화도 의미가 있고, 바이트 지표는 run-to-run 잡음이 커 더 큰 문턱을 씁니다.
+    혼합 버킷 `other`는 리소스 중앙값이 불안정해 **기존 15% 단일 문턱**(`RESOURCE_FLOOR_OTHER`)
+    유지. **무거워짐 판정 시 문턱을 넘은 지표를 전부** *"request count 164 to 174 (+6.1%)"*
+    형태로 서술·권고에 나열(`exceeded`, `resource_change_phrase`).
+  - 이 리소스 숫자(중앙값·%)는 "p75"와 한 문장에 함께 나올 때 number-binding이 오탐하지
+    않도록 `collect_resource_numbers()`로 pre-approve(RTT-라벨 리터럴 `LABEL_LITERAL_NUMBERS`와
+    동일 계열 처리).
 - **신규/급증 세그먼트(C)**: DFL 분해는 **baseline이 없는 새 트래픽**(예: 클라우드 ISP
   급증)을 재가중할 수 없어 그 영향이 within으로 샙니다. `new_segment_probe()`가
   **정상 count < min_n(≈150) OR (이상 share ≥ 3% AND 이상/정상 ≥ 5×)** 인 세그먼트를
