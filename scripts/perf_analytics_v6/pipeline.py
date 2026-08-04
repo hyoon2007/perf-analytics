@@ -1853,6 +1853,24 @@ def collect_supplied_text(findings):
     return supplied
 
 
+def collect_resource_numbers(findings):
+    """Resource-probe figures (request-count / byte-weight medians and their %
+    change) are pipeline-supplied resource numbers. A local-regression fact or
+    recommendation legitimately mentions BOTH 'p75' and these resource numbers in
+    one sentence, which would make the binding check wrongly judge e.g. '174' or
+    '6.1' as 'used with p75'. Preapprove them, like the segment-label literals."""
+    nums = set()
+    for r in ((findings.get("segments") or {}).get("focus_list") or []):
+        rp = r.get("resource_probe") or {}
+        for d in rp.values():
+            if isinstance(d, dict):
+                for k in ("normal_median", "anomaly_median", "delta_pct"):
+                    v = d.get(k)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        nums.add(round(float(v), 2))
+    return nums
+
+
 def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
     """Guard rail learned the hard way three times (the '103' lever, the
     pre-written fact sentences, the localization sentence): ANY text we give the
@@ -1864,15 +1882,19 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
                 and ("narrative_facts" in findings_or_facts
                      or "section_facts" in findings_or_facts)
                 else dict(findings_or_facts))
-    # bucket-boundary numbers in our own segment labels (e.g. '150' in
-    # '>150ms RTT') are descriptive vocabulary, not metric values — exempt them
+    # numbers that are our own descriptive vocabulary, not metric claims: segment
+    # label boundaries (e.g. '150' in '>150ms RTT') and resource-probe figures
+    # (request count / byte weight) that share a sentence with 'p75'. Exempt them
     # from both the binding check and the whitelist check.
-    allowed_with_labels = set(allowed_numbers) | LABEL_LITERAL_NUMBERS
+    supplied_literals = LABEL_LITERAL_NUMBERS | (
+        collect_resource_numbers(findings_or_facts)
+        if isinstance(findings_or_facts, dict) else set())
+    allowed_with_labels = set(allowed_numbers) | supplied_literals
     bugs = []
     for key, sentence in supplied.items():
         if not isinstance(sentence, str):
             continue
-        bad = check_number_binding(sentence, bindings, preapproved=LABEL_LITERAL_NUMBERS)
+        bad = check_number_binding(sentence, bindings, preapproved=supplied_literals)
         if bad:
             bugs.append(f"{key} fails number-binding: {bad}")
         degen = check_degenerate_comparison(sentence)
@@ -3044,6 +3066,9 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     print(f"self-check passed: {len(collect_supplied_text(findings))} supplied strings are gate-clean")
     playbook_actions = findings.get("remediation_playbook", [])
     focus_segments = [r["segment"] for r in (findings["segments"].get("focus_list") or [])]
+    # same descriptive-vocabulary exemptions the self-check uses (segment-label
+    # boundaries + resource-probe figures), applied to the model's output too.
+    binding_preapproved = LABEL_LITERAL_NUMBERS | collect_resource_numbers(findings)
 
     best = {"score": None, "text": None, "num": None}
     report_md, report_source = None, "fallback_template"
@@ -3063,7 +3088,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         raw_feat   = [d_["feature"] for d_ in findings["performance_drivers"] if d_["feature"] in cand]
         causal_bad = check_causal_misuse_v6(cand, symptom_labels)
         scope_bad  = check_recommendation_scope(cand, playbook_actions)
-        bind_bad   = check_number_binding(cand, metric_bindings, preapproved=LABEL_LITERAL_NUMBERS)
+        bind_bad   = check_number_binding(cand, metric_bindings, preapproved=binding_preapproved)
         degen_bad  = check_degenerate_comparison(cand)
         url_missing= verify_urls_present(cand, PAGE_GROUP_URLS, focus_segments)
         structure  = has_required_structure(cand)
