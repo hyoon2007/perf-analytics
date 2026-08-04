@@ -270,6 +270,24 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
 > 검증(7-30_176 TBT, 2,693.5→806, −70%): verdict=improved, delivery=degraded여도
 > delivery 권고 억제, 권고 = *"smartphones 자체 회귀 조사(요청수 163→163=실행부하)"*.
 
+### coverage vs mix/within 명확화 · 지지도 노출 (v6.9.8)
+리포트에 **서로 다른 두 분해**가 라벨 없이 병치되어 모순처럼 읽히던 문제 수정:
+- **두 분해는 별개** — (1) `quantile_decomposition`의 **mix/within(전체 트래픽, DFL 재가중,
+  합=100%)** vs (2) `coverage_check`의 **page_group leave-out(명명 page type만)**. 전자는
+  *"Across all traffic … add up to the whole change"*, 후자는 *"At the page-type level …"*
+  로 **범위를 명시**.
+- **"unaccounted for" 폐기** — coverage < 70%면 잔차를 *"미설명"*이 아니라
+  *"여러 작은 page type·하위 구성(국가/네트워크/기기)에 걸친 광범위 이동 — 단일 누락 섹션
+  아님, 위 구성 분해와 일치"*로 재서술(verdict/fallback/hypothesis 동일 적용).
+- **coverage 공정화** — leave-out 대상에 headline focus + **강등된 `additional_segments`**
+  포함 → 강등 mover가 미설명분으로 오집계되지 않음.
+- **지지도 노출** — `common_support_pct`를 본문에 표기(`decomposition_support`): ≥90%면
+  *"well-supported"*, 미만이면 *"read with caution"* 경고. 분위수 분해 신뢰도 가시화.
+
+> 검증(8-4_96 TBT, Δ−396.2ms): mix −348.2 + within −48(support 99.1%), coverage
+> 31%→**50%**(강등분 반영), 잔차 −198을 *"broad shift across smaller page types"*로 서술.
+> self-check 통과(18 strings gate-clean).
+
 ### 번호 검증과의 관계
 위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown·resource·
 new_segments 등)의 값은 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한
