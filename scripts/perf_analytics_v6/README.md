@@ -288,6 +288,29 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
 > 31%→**50%**(강등분 반영), 잔차 −198을 *"broad shift across smaller page types"*로 서술.
 > self-check 통과(18 strings gate-clean).
 
+### 신규 세그먼트 오염 ↔ 자체회귀·verdict·권고 조정 (v6.9.9)
+재가중 불가능한 **신규/급증 세그먼트(new_segment_probe)** 가 focus 페이지의 자체 트래픽을
+지배하면, DFL이 그 부하를 focus의 `within`(자체 회귀)으로 잘못 넣어 **"진짜 느려짐" +
+"그냥 무거운 트래픽"** 이 동시에 출력되고, 있지도 않은 코드 회귀 조사를 권고하던 문제 수정.
+- **탐지** `new_segment_focus_share()`: focus 이상창 트래픽 중 신규 세그먼트 비중. **≥20%
+  (`NEW_SEG_FOCUS_FLOOR`) AND focus 정상창 비중 <3%** 면 오염. **신규 세그먼트 없으면 즉시
+  no-op**(비용 0), caller의 focus 슬라이스 재사용(추가 full-df 패스 없음).
+- **Phase 1**: 오염 시 focus의 `genuine_regression` 강등 → role 문구가 *"a surge of new,
+  unbaselined traffic (X now N% of this page's anomaly traffic) … unconfirmed; verify the
+  traffic source"* 로. resource·local-regression 문구는 게이트로 자동 소거.
+  number-free `decomposition_caveat`로 within을 "upper bound"로 표기.
+- **Phase 2**: **최상단 신규 액션 `verify_traffic_source`**(봇/합성/ISP 필터·캠페인 설정
+  확인). 실사용자·릴리스감사 전제 액션 5종(ivm/prefetch/offload/third_party/reduce)은
+  `traffic_source_suspect == false` 게이트로 오염 시 억제.
+- **Phase 3**: 단일 focus가 오염으로 자체회귀를 잃으면 **verdict용 within_material만 강등**
+  → `mix_shift_with_local_regression` → `traffic_mix_shift`, Executive Summary의 "became
+  genuinely slower" 제거. 원 분해 ms는 본문에 유지(캐비어트와 함께).
+
+> 검증(8-5_042 LCP): Azure(isp) 0.06→13.1%, **tvs 이상창의 77%가 Azure** → tvs
+> genuine_regression 강등, verdict `mix_shift_with_local_regression`→**`traffic_mix_shift`**,
+> 권고 = *"Verify traffic source"* 단일, self-check 통과(28 strings). 성능: 신규 세그먼트
+> 없는 리포트는 추가 비용 0(가드).
+
 ### 번호 검증과의 관계
 위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown·resource·
 new_segments 등)의 값은 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한
