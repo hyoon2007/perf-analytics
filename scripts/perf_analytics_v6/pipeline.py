@@ -590,6 +590,49 @@ def new_segment_probe(df, dims, timer_col="timer", label_col="label",
     return hits[:4]
 
 
+# v6.9.9: how much of a focus page type's OWN anomaly traffic is a new/surging
+# (unbaselined) segment. When a large share is, the DFL cannot reweight it, so
+# its heavy load leaks into the focus's "within" and inflates the apparent
+# self-regression. NEW_SEG_FOCUS_FLOOR = share of the focus's anomaly traffic a
+# new segment must occupy to be treated as contaminating; the focus's normal-
+# window share of that segment must also be trivial (genuinely new inside it).
+NEW_SEG_FOCUS_FLOOR = 20.0
+NEW_SEG_FOCUS_NORMAL_MAX = 3.0
+
+
+def new_segment_focus_share(seg_df, new_segments, label_col="label"):
+    """Given ONE focus page type's rows (`seg_df`) and the sitewide new/surging
+    segments from new_segment_probe, return the single new segment that occupies
+    the largest share of the focus's ANOMALY traffic, with a `contaminated` flag.
+    Cheap: skips entirely when there are no new segments, and reuses the caller's
+    already-sliced focus frame (no extra full-df pass)."""
+    if not new_segments:
+        return {"contaminated": False, "label": None,
+                "focus_anom_share_pct": 0.0, "focus_normal_share_pct": 0.0}
+    is_a = seg_df[label_col] == 1
+    is_n = seg_df[label_col] == 0
+    na, nn = int(is_a.sum()), int(is_n.sum())
+    best = {"contaminated": False, "label": None,
+            "focus_anom_share_pct": 0.0, "focus_normal_share_pct": 0.0}
+    if na == 0:
+        return best
+    for ns in new_segments:
+        dim, seg = ns["dim"], ns["segment"]
+        if dim not in seg_df:
+            continue
+        col = seg_df[dim].astype(str)
+        a_share = float((col[is_a] == seg).sum()) / na * 100.0
+        n_share = (float((col[is_n] == seg).sum()) / nn * 100.0) if nn else 0.0
+        if a_share <= best["focus_anom_share_pct"]:
+            continue
+        best = {"contaminated": bool(a_share >= NEW_SEG_FOCUS_FLOOR
+                                     and n_share < NEW_SEG_FOCUS_NORMAL_MAX),
+                "label": ns.get("human_label") or seg,
+                "focus_anom_share_pct": round(a_share, 1),
+                "focus_normal_share_pct": round(n_share, 1)}
+    return best
+
+
 # ============================ v4 additions ============================
 def select_focus_segments(primary_movers, overall_win, dim,
                           min_share_pp=1.0, min_p75_delta=80,
@@ -1952,6 +1995,16 @@ def build_narrative_facts(findings):
                     f"have a matching normal-window segment to reweight against, so part of the change "
                     f"cannot be cleanly split into mix vs own change.")
 
+    # v6.9.9: when a new/unbaselined segment dominates a focus page type, the
+    # DFL cannot reweight it and its heavy load leaks into the "own change"
+    # (within) component — so that figure is an upper bound, not confirmed
+    # slowdown. Number-free, so it never trips the numeric validators.
+    if findings.get("traffic_source_suspect"):
+        facts["decomposition_caveat"] = (
+            "Part of the 'own change' component may be new, unbaselined traffic that cannot be "
+            "reweighted rather than the page slowing on its own; treat the genuine-slowdown share "
+            "as an upper bound until the traffic source is verified.")
+
     # v6.9.1 FIX: only assert a "new-visitor" audience shift when the
     # new_visitor_influx signal actually fired. Previously this sentence was
     # emitted unconditionally and hardcoded "more first-time visitors", so on
@@ -2041,7 +2094,15 @@ def build_narrative_facts(findings):
         # by an internal shift (e.g. more India / paid traffic inside it) reads as
         # a mix effect, matching the sub-segment breakdown that follows.
         gained, genuine = r.get("gained_share"), r.get("genuine_regression")
-        if genuine and gained:
+        _ov = r.get("new_traffic_overlap") or {}
+        if r.get("genuine_regression_suppressed"):
+            # v6.9.9: a new, unbaselined segment dominates this page's anomaly
+            # traffic, so an apparent self-slowdown here cannot be confirmed.
+            role = (f" — but a surge of new, unbaselined traffic ({_ov.get('label')} now "
+                    f"{fmt_pct(_ov.get('focus_anom_share_pct', 0))} of this page's anomaly "
+                    f"traffic) cannot be reweighted, so an apparent self-slowdown here is "
+                    f"unconfirmed; verify the traffic source before treating it as a code regression.")
+        elif genuine and gained:
             role = (" — it grew its share AND, holding its own internal traffic mix "
                     "constant, still slowed genuinely; investigate both.")
         elif genuine:
@@ -2232,7 +2293,7 @@ def build_section_facts(findings):
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
     for key in ("focus_growth", "new_segment", "decomposition", "decomposition_support",
-                "audience", "client_side", "coverage"):
+                "decomposition_caveat", "audience", "client_side", "coverage"):
         if key in flat:
             sec["What Changed"].append(flat[key])
     for key, sentence in flat.items():
@@ -2315,11 +2376,27 @@ import re
 # Signals are simple dotted-path + operator checks against findings.
 AKAMAI_PLAYBOOK = [
     {
+        # v6.9.9: FIRST when an unbaselined segment (e.g. a datacenter/cloud ISP,
+        # bot, or ad-verification burst) dominates the affected page type. Its
+        # heavy, unreweightable load can masquerade as a page slowdown, so the
+        # source must be qualified before any performance work is warranted.
+        "id": "verify_traffic_source",
+        "when": ["traffic_source_suspect == true"],
+        "levers": ["mPulse segmentation (bot / synthetic / ISP filters)",
+                   "campaign & synthetic-monitoring configuration review"],
+        "action": ("First determine whether the surging new traffic segment on the affected "
+                   "page type is real users or synthetic/bot/ad-verification traffic (filter "
+                   "bots and re-check the metric, and confirm the campaign or monitoring "
+                   "configuration) before any performance optimisation."),
+        "scope_tag": "traffic_source",
+    },
+    {
         "id": "ivm_hero_cold_cache",
         "applies_to": ["lcp", "fcp"],          # visual paint metrics with a hero element
         "when": ["verdict in traffic_mix_shift,mix_shift_with_local_regression,"
                  "multi_segment_mix_shift,multi_segment_regression",
-                 "behavior.new_visitor_influx == true"],
+                 "behavior.new_visitor_influx == true",
+                 "traffic_source_suspect == false"],
         "levers": ["Image & Video Manager (adaptive/right-sized hero media)",
                    "EdgeWorkers (LCP element preload hint injection)"],
         "action": ("Right-size and preload the growing section's LCP element "
@@ -2331,7 +2408,8 @@ AKAMAI_PLAYBOOK = [
         "id": "prefetch_event_landing",
         "applies_to": ["lcp", "fcp", "ttfb"],  # paint + server-wait
         "when": ["behavior.new_visitor_influx == true",
-                 "behavior.anomaly.landing_share_pct > 70"],
+                 "behavior.anomaly.landing_share_pct > 70",
+                 "traffic_source_suspect == false"],
         "levers": ["EdgeWorkers (Early Hints)",
                    "Adaptive Acceleration (automatic push/preload)"],
         "action": ("Enable early-hints/preload for the critical render-path "
@@ -2343,7 +2421,8 @@ AKAMAI_PLAYBOOK = [
         "id": "offload_regional_origin",
         "applies_to": ["lcp", "fcp", "ttfb"],
         "when": ["delivery.verdict == clean",
-                 "within_regression.within_regression == true"],
+                 "within_regression.within_regression == true",
+                 "traffic_source_suspect == false"],
         "levers": ["Tiered Distribution / cache key review",
                    "Cloud Wrapper (origin offload for cold regions)"],
         "action": ("Confirm the growing region is served from a nearby edge "
@@ -2365,7 +2444,8 @@ AKAMAI_PLAYBOOK = [
     {
         "id": "third_party_release_audit",
         "applies_to": ["lcp", "fcp", "ttfb", "tbt"],
-        "when": ["within_regression.within_regression == true"],
+        "when": ["within_regression.within_regression == true",
+                 "traffic_source_suspect == false"],
         "levers": ["Script Management / third-party tag review",
                    "release-change correlation"],
         "action": ("Verify no recent release or third-party tag change landed "
@@ -2377,7 +2457,8 @@ AKAMAI_PLAYBOOK = [
         "id": "reduce_main_thread_blocking",
         "applies_to": ["tbt"],
         "when": ["verdict in traffic_mix_shift,mix_shift_with_local_regression,"
-                 "multi_segment_mix_shift,multi_segment_regression,segment_regression"],
+                 "multi_segment_mix_shift,multi_segment_regression,segment_regression",
+                 "traffic_source_suspect == false"],
         "levers": ["Script Management (defer/async non-critical JS)",
                    "EdgeWorkers (offload work from the client)",
                    "third-party tag audit (long tasks)"],
@@ -2859,6 +2940,16 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
             if len(_urls):
                 PAGE_GROUP_URLS[focus["segment"]] = _urls.value_counts().index[0]
 
+    # v6.9.5: NEW / SURGING environment segments (e.g. a cloud-ISP burst) that the
+    # DFL decomposition cannot reweight — surfaced by name so their impact is not
+    # silently read as a per-page genuine slowdown. v6.9.9: computed BEFORE the
+    # focus loop so each focus can test whether such a segment dominates its own
+    # traffic (and therefore contaminates its apparent within-regression).
+    new_segments = new_segment_probe(df, ["isp", "country", "connectiontype"], TIMER_COL, LABEL_COL)
+    if new_segments:
+        print("new/surging segments:", [(s["dim"], s["segment"],
+              f"{s['normal_share_pct']}->{s['anomaly_share_pct']}%") for s in new_segments])
+
     # v6.9.4: for EACH focus page type, split its own p75 rise into an internal
     # mix shift vs a genuine same-audience slowdown, so the role label reflects
     # what really happened (a section whose rise is mostly an internal India /
@@ -2869,6 +2960,17 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         _r["genuine_regression"] = _split["genuine_regression"]
         _r["subcomp_mix_ms"] = _split["mix_effect_ms"]
         _r["genuine_within_ms"] = _split["within_effect_ms"]
+        # v6.9.9: if a new/unbaselined segment dominates THIS focus's anomaly
+        # traffic, the DFL cannot reweight it and its heavy load leaks into the
+        # focus's "within" — so an apparent self-regression here is unconfirmed.
+        # Suppress the genuine-regression claim (and, below, the release-audit
+        # recommendation and verdict) rather than chase a code change that the
+        # evidence does not support.
+        _ov = new_segment_focus_share(_seg_df, new_segments, LABEL_COL)
+        _r["new_traffic_overlap"] = _ov
+        if _r["genuine_regression"] and _ov["contaminated"]:
+            _r["genuine_regression"] = False
+            _r["genuine_regression_suppressed"] = True
         # v6.9.5: for a GENUINE regression, probe whether the page got heavier
         # (content/third-party change) or stayed the same weight (execution/infra).
         if _r["genuine_regression"] and METRIC_PROFILE.get("resource_focus"):
@@ -2880,13 +2982,16 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
                 _seg_df, METRIC_PROFILE["resource_focus"], LABEL_COL,
                 rel_floor=RESOURCE_FLOOR_OTHER, floors=_floors)
 
-    # v6.9.5: NEW / SURGING environment segments (e.g. a cloud-ISP burst) that the
-    # DFL decomposition cannot reweight — surfaced by name so their impact is not
-    # silently read as a per-page genuine slowdown.
-    new_segments = new_segment_probe(df, ["isp", "country", "connectiontype"], TIMER_COL, LABEL_COL)
-    if new_segments:
-        print("new/surging segments:", [(s["dim"], s["segment"],
-              f"{s['normal_share_pct']}->{s['anomaly_share_pct']}%") for s in new_segments])
+    # v6.9.9: a new segment concentrated in a focus makes the whole within signal
+    # suspect. `traffic_source_suspect` gates the release-audit / real-user
+    # playbook actions and surfaces a "verify the traffic source first" action.
+    traffic_source_suspect = any((r.get("new_traffic_overlap") or {}).get("contaminated")
+                                 for r in focus_list)
+    # verdict downgrade (Phase 3) only when the SOLE focus lost its genuine-
+    # regression claim to contamination — the exact case that would otherwise be
+    # mislabelled a local regression.
+    verdict_within_suspect = bool(len(focus_list) == 1
+                                  and focus_list[0].get("genuine_regression_suppressed"))
 
     print(f"\nfocus sections ({len(focus_list)}):")
     for r in focus_list:
@@ -2909,8 +3014,15 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # low-memory traffic within it). Only call it a genuine regression when the
     # composition-controlled interacted decomposition ALSO shows a material
     # within effect — otherwise the rise is a mix shift, not a page slowdown.
+    # v6.9.9: when the sole focus's within is contaminated by an unbaselined new
+    # segment, treat within as non-material for the VERDICT (flips e.g.
+    # mix_shift_with_local_regression -> traffic_mix_shift and drops the "became
+    # genuinely slower" summary). The raw decomposition ms are kept for the body,
+    # which carries the contamination caveat instead.
+    verdict_materiality = ({**materiality, "within_material": False}
+                           if verdict_within_suspect else materiality)
     within_flags["within_regression"] = bool(
-        within_flags["within_regression"] and materiality.get("within_material"))
+        within_flags["within_regression"] and verdict_materiality.get("within_material"))
     if focus:
         print(f"primary focus within-regression: {within_flags['within_regression']} "
               f"(median Δ={within_flags['focus_median_delta_ms']}ms, p75 Δ={within_flags['focus_p75_delta_ms']}ms)")
@@ -2969,7 +3081,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     verdict_code, verdict_sentence = select_verdict(
         severity, decomp[PRIMARY_DIM], localization, behavior_focus, delivery,
         outliers, within_flags=within_flags,
-        focus_selection=focus_selection, coverage=coverage, materiality=materiality)
+        focus_selection=focus_selection, coverage=coverage, materiality=verdict_materiality)
 
     def _label_movers(movers, dim):
         out = []
@@ -3021,6 +3133,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         "within_regression": within_flags,
         "focus_breakdown": focus_composition,
         "new_segments": new_segments,
+        "traffic_source_suspect": traffic_source_suspect,
         "segments": {
             "primary_dim": PRIMARY_DIM,
             "primary_share_movers": _label_movers(primary_movers["share_movers"][:5], PRIMARY_DIM),
