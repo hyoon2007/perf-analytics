@@ -311,6 +311,24 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
 > 권고 = *"Verify traffic source"* 단일, self-check 통과(28 strings). 성능: 신규 세그먼트
 > 없는 리포트는 추가 비용 0(가드).
 
+### 이상창 폭발·대형-baseline 세그먼트 표면화 + heavy→slow 문구 (v6.9.10)
+같은 8-5 LCP에서 **US 국가 트래픽(사이트 17.5→31.7%, tvs 내부 12→92%, p75 2,654→18,652)** 이
+최대 주범인데도 리포트에 이름이 없던 문제. **세 필터가 US를 걸러냈음**을 확인하고 수정:
+- **`focus_breakdown` 무거움 게이트가 정상창 p75만 봄** → 정상창엔 평범(2,654<2,656)했다가
+  이상창에 폭발한 US를 제외. → **`max(정상, 이상) p75`** 로 판정·정렬. `max()`라 기존 세그먼트
+  점수는 거의 불변, **이상창 폭발분만 추가**됨.
+- **`top_movers` min_n(두 창 모두 150) 요구** → US-in-tvs 정상 124행이 탈락. → focus_breakdown
+  호출 min_n을 **100**으로. (100 미만 무-baseline은 `new_segment_probe`가 별도 담당)
+- **`new_segment_probe` 5배 급증 기준**이 대형-baseline 배증(US 1.8배)을 놓침 → **절대 증가폭
+  `notable_shift`(≥10%p) 경로 추가**, `surge_kind`로 태깅. **오염 탐지(`new_segment_focus_share`)·
+  verdict 강등은 `unbaselined`만** 소비 → US 같은 재가중 가능 세그먼트는 이름만 나오고 자체회귀를
+  잘못 억제하지 않음. 별도 `notable_shift` 서술(baseline 있는 어법).
+- **문구**: 속도 뜻 `heavier`→`slower`(서술 5곳). 용량 뜻 `page weight`·resource-probe는 유지.
+
+> 검증(8-5 LCP): tvs 내부 *"United States 12.1%→92.2%"* #1, 사이트 *"United States 17.4%→31.7%,
+> plus 1 other large shift"* 표면화. verdict `traffic_mix_shift` 유지(오염은 Azure만),
+> self-check 통과(30 strings). 회귀(8-3 TBT): verdict 불변, notable_shift가 Korea 이동도 정확 포착.
+
 ### 번호 검증과의 관계
 위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown·resource·
 new_segments 등)의 값은 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한
