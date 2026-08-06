@@ -2962,10 +2962,17 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         for d in SECONDARY_DIMS:
             drilldown[d]=top_movers(focus_df, d, TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
         # v6.9.2: which audience/device sub-segments drove the focus section's rise
+        # v6.9.10: min_n=100 (not MIN_SEG_N//2=150) so a sub-segment that was
+        # small in the normal window but exploded in the anomaly window (e.g.
+        # US inside tvs: 124 normal rows -> 4,349 anomaly rows) still qualifies.
+        # top_movers requires min_n in BOTH windows, so a too-high floor hides
+        # exactly the anomaly-driven influx we most want to name. 100 rows is
+        # still enough for a rough p75; truly baseline-less segments (<100 normal)
+        # are caught separately by new_segment_probe.
         focus_composition=focus_breakdown(
             focus_df, ["paidmedia", "mem_bucket", "country", "connectiontype",
                        "deviceType", "isp", "rtt_bucket"],
-            float(focus["p75_normal"]), TIMER_COL, LABEL_COL, min_n=max(100, MIN_SEG_N//2))
+            float(focus["p75_normal"]), TIMER_COL, LABEL_COL, min_n=100)
         # v6.9.3: align the focus section's example URL with the growth story. If
         # the breakdown pins the growth to a country, cite a URL from THAT country
         # in the anomaly window rather than the overall most-frequent one (which
