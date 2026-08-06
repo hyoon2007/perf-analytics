@@ -422,25 +422,33 @@ def _breakdown_label(dim, seg):
 def focus_breakdown(focus_df, dims, focus_p75_normal, timer_col="timer",
                     label_col="label", min_n=100, min_share_pp=1.0, top=3):
     """Within the focus page type, find the audience/device sub-segments whose
-    share GREW and that carry ABOVE-focus TBT — the composition shift that
+    share GREW and that are SLOWER than the focus — the composition shift that
     actually pushed the focus section's aggregate up (e.g. more paid-media,
-    lower-memory, or India traffic on a heavy product page). Returns the top
-    movers across all dims, ranked by contribution (share gain x heaviness)."""
+    lower-memory, or India traffic on a slow product page). Returns the top
+    movers across all dims, ranked by contribution (share gain x slowness).
+
+    v6.9.9: "slower" is judged on the WORSE of the two windows (max of normal /
+    anomaly p75). The old test used the NORMAL window only, so a sub-segment that
+    was average in the baseline but blew up in the anomaly window (e.g. a US
+    datacenter influx that went 2,654 -> 18,652 ms) was filtered out even though
+    it drove the whole rise. Using max() barely changes already-slow segments
+    (their max is still ~normal) and only ADDS the anomaly-exploded ones."""
     cands = []
     for dim in dims:
         if dim not in focus_df:
             continue
         mv = top_movers(focus_df, dim, timer_col, label_col, min_n=min_n)
         for r in mv["share_movers"]:
-            if r["share_delta_pp"] < min_share_pp or r["p75_normal"] <= focus_p75_normal:
-                continue  # only sub-segments that GREW and are heavier than the focus itself
+            worst_p75 = max(r["p75_normal"], r["p75_anomaly"])
+            if r["share_delta_pp"] < min_share_pp or worst_p75 <= focus_p75_normal:
+                continue  # only sub-segments that GREW and are slower than the focus itself
             cands.append({
                 "dim": dim, "segment": str(r["segment"]),
                 "human_label": _breakdown_label(dim, r["segment"]),
                 "share_normal_pct": r["share_normal_pct"], "share_anomaly_pct": r["share_anomaly_pct"],
                 "share_delta_pp": r["share_delta_pp"],
                 "p75_normal": r["p75_normal"], "p75_anomaly": r["p75_anomaly"],
-                "contribution_score": round(r["share_delta_pp"] / 100.0 * (r["p75_normal"] - focus_p75_normal), 1),
+                "contribution_score": round(r["share_delta_pp"] / 100.0 * (worst_p75 - focus_p75_normal), 1),
             })
     cands.sort(key=lambda x: -x["contribution_score"])
     return cands[:top]
@@ -554,14 +562,23 @@ def resource_change_phrase(rp, metrics):
 
 
 def new_segment_probe(df, dims, timer_col="timer", label_col="label",
-                      min_normal_n=150, min_anom_share=3.0, surge_ratio=5.0):
-    """Detect NEW or SURGING environment segments — traffic the DFL decomposition
-    cannot handle because it has little or no normal-window baseline to reweight
-    against (e.g. a cloud-ISP burst). A segment qualifies when it is material in
-    the anomaly window (share >= min_anom_share) AND either under-baselined
-    (normal count < min_normal_n) or surged (anomaly share >= surge_ratio x normal
-    share). These are surfaced by NAME, since their impact would otherwise leak
-    into the 'genuine slowdown' bucket."""
+                      min_normal_n=150, min_anom_share=3.0, surge_ratio=5.0,
+                      min_notable_pp=10.0):
+    """Detect environment segments whose share moved enough to matter, tagged by
+    KIND so the two downstream uses stay separate:
+
+    * `surge_kind="unbaselined"` — little/no normal-window baseline to reweight
+      against (normal count < min_normal_n, OR anomaly share >= surge_ratio x
+      normal share). The DFL cannot reweight these, so ONLY these feed the
+      contamination check (new_segment_focus_share) and the verdict downgrade.
+    * `surge_kind="notable_shift"` (v6.9.9) — a LARGE absolute shift
+      (share_delta >= min_notable_pp) in a segment that DOES have a baseline
+      (e.g. US country 17.5% -> 31.7%). The 5x surge test misses these because a
+      big-baseline segment that merely doubles is < 5x. These are named in the
+      report but MUST NOT feed contamination — they are reweightable, so calling
+      them 'unbaselined' would wrongly suppress a genuine regression.
+
+    Both require material anomaly presence (share >= min_anom_share)."""
     Nn = int((df[label_col] == 0).sum())
     Na = int((df[label_col] == 1).sum())
     if Nn == 0 or Na == 0:
@@ -577,12 +594,14 @@ def new_segment_probe(df, dims, timer_col="timer", label_col="label",
             n_share = c0 / Nn * 100
             if a_share < min_anom_share:
                 continue
-            surged = (c0 < min_normal_n) or (n_share == 0) or (n_share > 0 and a_share / n_share >= surge_ratio)
-            if not surged:
+            unbaselined = (c0 < min_normal_n) or (n_share == 0) or (n_share > 0 and a_share / n_share >= surge_ratio)
+            notable = (a_share - n_share) >= min_notable_pp
+            if not (unbaselined or notable):
                 continue
             p75a = float(sub.loc[sub[label_col] == 1, timer_col].quantile(.75)) if c1 else None
             hits.append({"dim": dim, "segment": str(val),
                          "human_label": _breakdown_label(dim, val),
+                         "surge_kind": "unbaselined" if unbaselined else "notable_shift",
                          "normal_share_pct": round(n_share, 2), "anomaly_share_pct": round(a_share, 2),
                          "normal_count": c0, "p75_anomaly": round(p75a, 1) if p75a is not None else None,
                          "share_delta_pp": round(a_share - n_share, 2)})
@@ -605,7 +624,12 @@ def new_segment_focus_share(seg_df, new_segments, label_col="label"):
     segments from new_segment_probe, return the single new segment that occupies
     the largest share of the focus's ANOMALY traffic, with a `contaminated` flag.
     Cheap: skips entirely when there are no new segments, and reuses the caller's
-    already-sliced focus frame (no extra full-df pass)."""
+    already-sliced focus frame (no extra full-df pass).
+
+    v6.9.9: ONLY 'unbaselined' segments count — a 'notable_shift' (a big segment
+    that has a baseline and is reweightable, e.g. US doubling) must not be read
+    as contamination, or it would wrongly suppress a genuine regression."""
+    new_segments = [s for s in (new_segments or []) if s.get("surge_kind") == "unbaselined"]
     if not new_segments:
         return {"contaminated": False, "label": None,
                 "focus_anom_share_pct": 0.0, "focus_normal_share_pct": 0.0}
@@ -1087,7 +1111,7 @@ def select_verdict(severity, decomp_primary, localization, behavior,
         # v6.9.6: dedicated IMPROVED verdict — the overall metric got BETTER.
         s=("The overall p75 improved in the anomaly window (it fell). This is a "
            "traffic-composition effect — lighter page types grew their share while "
-           "heavier ones shrank — so it may reverse when the traffic mix normalizes. "
+           "slower ones shrank — so it may reverse when the traffic mix normalizes. "
            "No action is needed for the overall metric.")
         return "improved", s
 
@@ -1122,7 +1146,7 @@ def select_verdict(severity, decomp_primary, localization, behavior,
         # Describe what actually happened per role — a co-focus can slow on its
         # own WITHOUT gaining share, so never blanket-claim they all grew share.
         if any_share and any_self:
-            s+=("Some grew their share of heavier traffic while others slowed on their "
+            s+=("Some grew their share of slower traffic while others slowed on their "
                 "own even as their share fell; each is listed with its own evidence.")
         elif any_share:
             s+=("The slower page types grew their share of traffic while the rest of the "
@@ -1970,7 +1994,7 @@ def build_narrative_facts(findings):
         if _tot >= 0:
             facts["decomposition"] = (
                 f"Across all traffic, of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes "
-                f"from a shift in traffic composition toward heavier page/device/traffic-type mixes "
+                f"from a shift in traffic composition toward slower page/device/traffic-type mixes "
                 f"and only {fmt_ms(_win)} from segments genuinely slowing on their own (holding that "
                 f"mix constant); these two components add up to the whole change.")
         else:
@@ -2054,7 +2078,7 @@ def build_narrative_facts(findings):
         abbr = (findings.get("meta") or {}).get("metric_abbrev", "TBT")
         facts["focus_growth"] = (
             f"Within {page_token(foc['segment'])}, the growth is concentrated in {parts} — "
-            f"all higher-{abbr} sub-segments, so the rise reflects a shift toward heavier "
+            f"all higher-{abbr} sub-segments, so the rise reflects a shift toward slower "
             f"traffic on that page type rather than the page itself slowing down.")
 
     # v6.9.1 improvement: absolute-severity context. The delta can be small while
@@ -2109,7 +2133,7 @@ def build_narrative_facts(findings):
             role = (" — its share fell yet, holding its own internal mix constant, it "
                     "genuinely slowed — a real local regression to investigate directly.")
         elif gained:
-            role = (" — its p75 rose mainly because it drew more of its own heavier "
+            role = (" — its p75 rose mainly because it drew more of its own slower "
                     "traffic (a shift in its internal country/device/traffic mix), not "
                     "because the page itself slowed down.")
         else:
@@ -2143,16 +2167,30 @@ def build_narrative_facts(findings):
                 f"scripts), not added page content.")
 
     # v6.9.5: a new / surging traffic segment with no baseline (e.g. a cloud-ISP
-    # burst) — its impact can be mistaken for a per-page slowdown.
+    # burst) — its impact can be mistaken for a per-page slowdown. v6.9.9: only
+    # 'unbaselined' segments get this wording (the notable-shift ones DO have a
+    # baseline, so "no normal-window comparison" would be false for them).
     ns = findings.get("new_segments") or []
-    if ns:
-        top = ns[0]
-        more = f", plus {len(ns) - 1} other new segment(s)" if len(ns) > 1 else ""
+    unbaselined = [s for s in ns if s.get("surge_kind") == "unbaselined"]
+    notable = [s for s in ns if s.get("surge_kind") == "notable_shift"]
+    if unbaselined:
+        top = unbaselined[0]
+        more = f", plus {len(unbaselined) - 1} other new segment(s)" if len(unbaselined) > 1 else ""
         facts["new_segment"] = (
             f"A new or surging traffic segment appeared with little baseline: {top['human_label']} "
             f"went from {fmt_pct(top['normal_share_pct'])} to {fmt_pct(top['anomaly_share_pct'])} of "
-            f"traffic{more}. New traffic has no normal-window comparison, so its (often heavier) load "
+            f"traffic{more}. New traffic has no normal-window comparison, so its (often slower) load "
             f"can be mistaken for a page slowdown — verify whether this influx is expected.")
+    # v6.9.9: a LARGE absolute audience shift that DOES have a baseline (missed by
+    # the 5x surge test, e.g. US 17.5% -> 31.7%). Named for the reader; the
+    # baseline wording above deliberately does NOT apply.
+    if notable:
+        top = notable[0]
+        more = f", plus {len(notable) - 1} other large shift(s)" if len(notable) > 1 else ""
+        facts["notable_shift"] = (
+            f"Sitewide, {top['human_label']} grew sharply, from {fmt_pct(top['normal_share_pct'])} to "
+            f"{fmt_pct(top['anomaly_share_pct'])} of traffic{more} — a large audience shift that "
+            f"largely coincides with the affected page type.")
 
     c = findings.get("coverage") or {}
     if c.get("coverage_ratio") is not None:
@@ -2292,8 +2330,8 @@ def build_section_facts(findings):
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
-    for key in ("focus_growth", "new_segment", "decomposition", "decomposition_support",
-                "decomposition_caveat", "audience", "client_side", "coverage"):
+    for key in ("focus_growth", "new_segment", "notable_shift", "decomposition",
+                "decomposition_support", "decomposition_caveat", "audience", "client_side", "coverage"):
         if key in flat:
             sec["What Changed"].append(flat[key])
     for key, sentence in flat.items():
