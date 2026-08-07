@@ -1192,9 +1192,13 @@ def select_verdict(severity, decomp_primary, localization, behavior,
            "or per-section effect dominating.")
 
     if low_cov:
-        s+=(f" Note: at the page-type level the identified sections localise only "
-            f"{int(round(coverage['coverage_ratio']*100))}% of the p75 change; the rest is a "
-            f"broad shift spread across many smaller page types, not a single missing section.")
+        # v6.9.11: number-free (the coverage fact carries the exact ms split). A
+        # bare "62% of the p75 change" here trips number-binding ('62' used with
+        # 'p75') — it surfaced once Fix A let TBT reach this branch instead of
+        # returning early on a delivery_regression verdict.
+        s+=(" Note: at the page-type level the identified sections localise only part of the "
+            "p75 change; the rest is a broad shift spread across many smaller page types, not "
+            "a single missing section.")
     return code, s
 
 
