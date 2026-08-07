@@ -329,6 +329,27 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
 > plus 1 other large shift"* 표면화. verdict `traffic_mix_shift` 유지(오염은 Azure만),
 > self-check 통과(30 strings). 회귀(8-3 TBT): verdict 불변, notable_shift가 Korea 이동도 정확 포착.
 
+### 지표-인지 delivery + coverage/within/notable-shift 정합 (v6.9.11)
+두 8-7 TBT 리포트에서 발견한 **문장 간 모순**들을 근본원인별로 수정:
+- **Fix A — delivery 지표 인지**: delivery 저하가 verdict·`delivery_investigate` 권고·delivery
+  서술에 개입하는 것을 **`delivery_relevant` 프로필 플래그**로 게이트(**tbt=False**, 나머지 True).
+  TBT는 메인스레드 지표라 CDN/origin 지연이 원인이 아님 → **"no regression, though degraded" 모순**과
+  **TBT에 배달 조사 권고** 둘 다 제거. 비관련+degraded면 *"delivery is not a driver"*로 명시.
+- **Fix B — confined ↔ coverage**: impact 문장의 *"confined … rest unaffected"* 를
+  `coverage.sufficient`로 게이트. 불충분이면 *"only partly localised …"*.
+- **Fix C — per-focus genuine ↔ 전체 within (억제 아닌 정합)**: 전체 `within_material=False`면
+  focus의 자체회귀 소견을 **유지**하되 *"secondary signal(다른 페이지 개선이 상쇄)"*로 scope 정합·
+  톤 완화 → 헤드라인("within −52")과 모순 제거, 진짜 회귀 누락도 방지.
+- **Fix D — notable_shift 방향 인지**: improved면 *"지표를 끌어내린 가벼운 트래픽"*, degradation이면
+  *"change를 유발했는지 확인"* (기존 "affected page type과 일치" 오귀속 제거).
+- 부수 수정: verdict 변경으로 노출된 잠재 버그 — `select_verdict` low-coverage 노트의 bare "62%"가
+  number-binding('62' used with 'p75')에 걸려 제거(coverage 본문 fact가 정확한 ms 보유).
+
+> 검증(8-7_196 improved / 8-7_2111 degradation, 둘 다 TBT): F1은 delivery "not a driver"·smartphones
+> "secondary signal"·Korea "lighter/faster pulled down", F2는 verdict `delivery_regression`→
+> **`traffic_mix_shift`** + 권고 **"Reduce main-thread blocking"** + "partly localised". self-check
+> 통과(24·28 strings). 회귀(8-5 LCP, delivery-relevant): verdict·self-check 불변.
+
 ### 번호 검증과의 관계
 위 문장 중 숫자를 담는 것(headline·decomposition·audience·focus_breakdown·resource·
 new_segments 등)의 값은 findings에서 그대로 온 화이트리스트 숫자이며, 새로 추가한
