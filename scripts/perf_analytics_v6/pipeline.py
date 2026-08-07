@@ -848,6 +848,7 @@ METRIC_PROFILES = {
         "effect_floor_ms": 50,          # min mix/within effect to be "material"
         "higher_is_worse": True,
         "hero_element": True,           # LCP has a hero element -> preload advice fits
+        "delivery_relevant": True,      # TTFB/origin latency is part of LCP
     },
     "fcp": {
         "display_name": "First Contentful Paint",
@@ -859,6 +860,7 @@ METRIC_PROFILES = {
         "effect_floor_ms": 40,
         "higher_is_worse": True,
         "hero_element": False,
+        "delivery_relevant": True,      # TTFB/origin latency is part of FCP
     },
     "tbt": {
         "display_name": "Total Blocking Time",
@@ -870,6 +872,7 @@ METRIC_PROFILES = {
         "effect_floor_ms": 25,
         "higher_is_worse": True,
         "hero_element": False,          # JS-bound: preload/hero advice does NOT fit
+        "delivery_relevant": False,     # main-thread/JS metric: CDN/origin latency is NOT a driver
     },
     "ttfb": {
         "display_name": "Waiting Time (Time to First Byte)",
@@ -882,6 +885,7 @@ METRIC_PROFILES = {
         "higher_is_worse": True,
         "hero_element": False,          # server/network-bound: origin/CDN advice fits
         "delivery_first": True,         # TTFB regressions point at delivery, not content
+        "delivery_relevant": True,      # TTFB IS the delivery metric
     },
     "_generic": {
         "display_name": "Timer", "abbrev": "TIMER", "unit": "ms",
@@ -889,6 +893,7 @@ METRIC_PROFILES = {
         "unit_kind": "duration", "good_ms": None, "poor_ms": None,
         "artifact_ms": 60_000, "severity_floor_ms": 100, "effect_floor_ms": 50,
         "higher_is_worse": True, "hero_element": False,
+        "delivery_relevant": True,      # unknown metric: keep delivery in scope (safe default)
     },
 }
 
@@ -1094,7 +1099,8 @@ def humanize_feature(feat, overrides=None):
 # --------------------------------------------------------- verdict selection
 def select_verdict(severity, decomp_primary, localization, behavior,
                    delivery, outliers, within_flags=None,
-                   focus_selection=None, coverage=None, materiality=None):
+                   focus_selection=None, coverage=None, materiality=None,
+                   delivery_relevant=True):
     """Rule-based story selection. v6.8: the mix/within split now comes from the
     p75 decomposition (same statistic as the headline), and an effect counts
     only when it is materially large, so both effects can be reported when both
@@ -1122,7 +1128,11 @@ def select_verdict(severity, decomp_primary, localization, behavior,
                 "percentile-based views are recommended.")
         return "no_action", s
 
-    if delivery["verdict"]=="degraded":
+    # v6.9.11: delivery drives the verdict ONLY for delivery-sensitive metrics.
+    # TBT is main-thread/JS — CDN/origin latency is not a mechanism for it, so a
+    # degraded delivery layer must not force a 'delivery_regression' verdict (and
+    # a "investigate CDN/origin" recommendation) on a TBT anomaly.
+    if delivery["verdict"]=="degraded" and delivery_relevant:
         return "delivery_regression", (
             "Delivery-layer metrics degraded in the anomaly window; CDN or origin "
             "behavior should be investigated first.")
@@ -2111,6 +2121,12 @@ def build_narrative_facts(findings):
             "client-side — main-thread JavaScript and third-party tags on the affected "
             "section — rather than in network delivery.")
 
+    # v6.9.11: is the SITE-WIDE own-change (within) material? A focus can genuinely
+    # regress while the site-wide within nets to ~0 (other page types offset it).
+    # When that happens we keep the focus's genuine finding but RECONCILE the scope
+    # and soften the "investigate directly" tone — otherwise the headline
+    # ("within -52 ms, no genuine slowdown") and the focus line contradict.
+    _within_mat_global = bool((findings.get("materiality") or {}).get("within_material"))
     for r in (findings.get("segments", {}).get("focus_list") or []):
         # v6.9.4: base the role on the composition-controlled split, not the raw
         # p75 delta. `genuine_regression` is True only when the section genuinely
@@ -2126,9 +2142,17 @@ def build_narrative_facts(findings):
                     f"{fmt_pct(_ov.get('focus_anom_share_pct', 0))} of this page's anomaly "
                     f"traffic) cannot be reweighted, so an apparent self-slowdown here is "
                     f"unconfirmed; verify the traffic source before treating it as a code regression.")
+        elif genuine and gained and not _within_mat_global:
+            role = (" — it grew its share AND its own p75 also rose; site-wide, though, "
+                    "other page types' improvements offset this so the net own-change is "
+                    "negligible, so treat the local rise as a smaller, secondary signal.")
         elif genuine and gained:
             role = (" — it grew its share AND, holding its own internal traffic mix "
                     "constant, still slowed genuinely; investigate both.")
+        elif genuine and not _within_mat_global:
+            role = (" — its own p75 rose while its share fell; site-wide the net own-change "
+                    "is negligible (offset by other page types), so this is a secondary "
+                    "signal rather than the main story.")
         elif genuine:
             role = (" — its share fell yet, holding its own internal mix constant, it "
                     "genuinely slowed — a real local regression to investigate directly.")
@@ -2187,10 +2211,21 @@ def build_narrative_facts(findings):
     if notable:
         top = notable[0]
         more = f", plus {len(notable) - 1} other large shift(s)" if len(notable) > 1 else ""
-        facts["notable_shift"] = (
-            f"Sitewide, {top['human_label']} grew sharply, from {fmt_pct(top['normal_share_pct'])} to "
-            f"{fmt_pct(top['anomaly_share_pct'])} of traffic{more} — a large audience shift that "
-            f"largely coincides with the affected page type.")
+        # v6.9.11: direction-aware. In an IMPROVED window the big shift is the
+        # LIGHTER/faster traffic that PULLED THE METRIC DOWN — not the problem — so
+        # "coincides with the affected page type" would be backwards.
+        _improved = (findings.get("headline") or {}).get("delta_ms", 0) < 0
+        if _improved:
+            facts["notable_shift"] = (
+                f"Sitewide, {top['human_label']} grew sharply, from {fmt_pct(top['normal_share_pct'])} "
+                f"to {fmt_pct(top['anomaly_share_pct'])} of traffic{more} — a large shift toward "
+                f"this lighter/faster traffic, which is what pulled the overall metric down (a "
+                f"composition effect that may reverse when the mix normalizes).")
+        else:
+            facts["notable_shift"] = (
+                f"Sitewide, {top['human_label']} grew sharply, from {fmt_pct(top['normal_share_pct'])} "
+                f"to {fmt_pct(top['anomaly_share_pct'])} of traffic{more} — a large audience shift; "
+                f"check whether it drove the change on the affected page types.")
 
     c = findings.get("coverage") or {}
     if c.get("coverage_ratio") is not None:
@@ -2236,9 +2271,21 @@ def build_narrative_facts(findings):
     if sev and fl and sev not in ("improved", "none", "info"):
         n_sec = len(fl)
         scope = ("one page type" if n_sec == 1 else f"{n_sec} page types")
-        facts["impact"] = (
-            f"Severity is {sev}: the change is statistically significant but confined "
-            f"to {scope}, so the rest of the site is unaffected.")
+        # v6.9.11: don't claim the change is "confined … rest unaffected" when
+        # coverage says a material remainder is broadly distributed — that
+        # contradicts the coverage line. Only claim confinement when coverage is
+        # sufficient (the named page types explain the change).
+        cov = findings.get("coverage") or {}
+        broad = cov.get("coverage_ratio") is not None and not cov.get("sufficient")
+        if broad:
+            facts["impact"] = (
+                f"Severity is {sev}: the change is statistically significant. It is only "
+                f"partly localised to {scope}; a further, broad shift affects other, smaller "
+                f"page types (see the coverage note).")
+        else:
+            facts["impact"] = (
+                f"Severity is {sev}: the change is statistically significant but confined "
+                f"to {scope}, so the rest of the site is unaffected.")
     return facts
 
 
@@ -2345,12 +2392,22 @@ def build_section_facts(findings):
         sec["What Did Not Change"].append(flat["audience_stable"])
     delivery = findings.get("delivery") or {}
     has_cdn = "cdncacherate" in (delivery.get("metrics") or {})
+    delivery_relevant = bool(findings.get("delivery_relevant", True))
+    metric_name = (findings.get("meta") or {}).get("metric", "this metric")
     # v6.9.1: the CDN cache hit rate is beacon-derived, not the CDN's own figure —
     # add a reference-only caveat wherever it informed the delivery assessment.
     cdn_caveat = ("The CDN cache hit rate here is derived from client beacons and may "
                   "differ from the actual cache hit rate reported by the CDN; use it for "
                   "reference only.")
-    if delivery.get("verdict") == "clean":
+    # v6.9.11: for a metric where delivery is NOT a mechanism (TBT), never let the
+    # delivery layer be surfaced as clean/degraded — it produced a contradictory
+    # "no regression, though degraded" line. State plainly it is not a driver.
+    if not delivery_relevant:
+        if delivery.get("verdict") == "degraded":
+            sec["What Did Not Change"].append(
+                f"Delivery-layer metrics (CDN/origin) moved in the anomaly window, but "
+                f"{metric_name} is a main-thread metric, so delivery is not a driver of this change.")
+    elif delivery.get("verdict") == "clean":
         sec["What Did Not Change"].append(
             "CDN and origin delivery metrics show no regression in the anomaly window.")
         if has_cdn:
@@ -2470,7 +2527,7 @@ AKAMAI_PLAYBOOK = [
     },
     {
         "id": "delivery_investigate",
-        "applies_to": ["lcp", "fcp", "ttfb", "tbt"],
+        "applies_to": ["lcp", "fcp", "ttfb"],   # v6.9.11: NOT tbt (main-thread, delivery-irrelevant)
         "when": ["delivery.verdict == degraded"],
         "levers": ["mPulse + DataStream 2 correlation",
                    "Origin health / offload review"],
@@ -3126,7 +3183,8 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     verdict_code, verdict_sentence = select_verdict(
         severity, decomp[PRIMARY_DIM], localization, behavior_focus, delivery,
         outliers, within_flags=within_flags,
-        focus_selection=focus_selection, coverage=coverage, materiality=verdict_materiality)
+        focus_selection=focus_selection, coverage=coverage, materiality=verdict_materiality,
+        delivery_relevant=METRIC_PROFILE.get("delivery_relevant", True))
 
     def _label_movers(movers, dim):
         out = []
@@ -3179,6 +3237,8 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         "focus_breakdown": focus_composition,
         "new_segments": new_segments,
         "traffic_source_suspect": traffic_source_suspect,
+        "delivery_relevant": bool(METRIC_PROFILE.get("delivery_relevant", True)),
+        "materiality": materiality,
         "segments": {
             "primary_dim": PRIMARY_DIM,
             "primary_share_movers": _label_movers(primary_movers["share_movers"][:5], PRIMARY_DIM),
