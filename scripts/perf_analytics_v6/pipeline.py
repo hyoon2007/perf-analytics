@@ -2425,6 +2425,21 @@ def build_section_facts(findings):
         sec["What Did Not Change"].append(
             f"Excluding the focus section, sitewide p75 {direction}, moving from "
             f"{fmt_ms(e[0])} to {fmt_ms(e[1])}.")
+    else:
+        # v6.9.11 (Fix E): when localization did not already state the rest-of-site
+        # behaviour, state it from the coverage residual. Otherwise "What Did Not
+        # Change" can be empty and the model improvises a line like "no segments
+        # outside the focus improved" — which contradicts a negative residual
+        # (the rest of the site DID improve). Number-free, so validator-safe.
+        resid = (findings.get("coverage") or {}).get("residual_p75_delta")
+        if resid is not None:
+            if resid < -1:
+                sec["What Did Not Change"].append(
+                    "Outside the identified page types, the rest of the site did not worsen — "
+                    "on balance it improved.")
+            elif resid <= 1:
+                sec["What Did Not Change"].append(
+                    "Outside the identified page types, the rest of the site held roughly steady.")
     return {k: v for k, v in sec.items() if v}
 
 
