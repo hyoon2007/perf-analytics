@@ -342,6 +342,10 @@ within ≥ mix` 일 때만 "genuinely slowed"로 표기합니다. 그렇지 않�
   톤 완화 → 헤드라인("within −52")과 모순 제거, 진짜 회귀 누락도 방지.
 - **Fix D — notable_shift 방향 인지**: improved면 *"지표를 끌어내린 가벼운 트래픽"*, degradation이면
   *"change를 유발했는지 확인"* (기존 "affected page type과 일치" 오귀속 제거).
+- **Fix E — What Did Not Change 결정론 보강**: localization이 rest-of-site를 서술 안 하면
+  coverage 잔차로 *"Outside the identified page types, the rest did not worsen — on balance it
+  improved"*(또는 held steady)를 채움. improved 케이스에서 섹션이 비어 LLM이 *"focus 밖은 개선
+  없음"* 같은 모순을 지어내던 것을 원천 차단(number-free).
 - 부수 수정: verdict 변경으로 노출된 잠재 버그 — `select_verdict` low-coverage 노트의 bare "62%"가
   number-binding('62' used with 'p75')에 걸려 제거(coverage 본문 fact가 정확한 ms 보유).
 
