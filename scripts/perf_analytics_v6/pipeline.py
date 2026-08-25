@@ -1331,6 +1331,7 @@ def render_fallback_report(f):
                      f"set may be involved.")
     lines.append("")
     lines.append("## What Did Not Change")
+    _wdnc_start = len(lines)
     _deliv = f.get("delivery") or {}
     _has_cdn = "cdncacherate" in (_deliv.get("metrics") or {})
     if _deliv.get("verdict")=="clean":
@@ -1343,6 +1344,20 @@ def render_fallback_report(f):
         ex=f["localization"]["excluded_p75"]
         lines.append(f"- Excluding the focus section(s), sitewide p75 moved from "
                      f"{fmt_ms(ex[0])} to {fmt_ms(ex[1])}.")
+    # v6.9.12 (Fix #1): the deterministic fallback builds this section on its own,
+    # so it needs the same never-empty guard as build_section_facts.
+    if len(lines) == _wdnc_start:
+        _cov = f.get("coverage") or {}
+        _broad = _cov.get("coverage_ratio") is not None and not _cov.get("sufficient")
+        if _deliv.get("verdict") == "degraded" and bool(f.get("delivery_relevant", True)):
+            lines.append("- This regression sits in the delivery layer (CDN/origin), which affects "
+                         "page types broadly rather than sparing a specific area.")
+        elif _broad:
+            lines.append("- The change is broadly distributed across many small page types rather than "
+                         "confined to a few, so there is no distinct unaffected area to call out.")
+        else:
+            lines.append("- The remaining movement is spread thinly across smaller page types, with no "
+                         "distinct unaffected area to highlight.")
     lines.append("")
     lines.append("## Recommended Actions")
     actions={
