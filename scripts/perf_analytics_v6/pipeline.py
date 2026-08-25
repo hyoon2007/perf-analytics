@@ -2440,6 +2440,28 @@ def build_section_facts(findings):
             elif resid <= 1:
                 sec["What Did Not Change"].append(
                     "Outside the identified page types, the rest of the site held roughly steady.")
+
+    # v6.9.12 (Fix #1): "What Did Not Change" is a required section, so an empty
+    # one renders as a bare header. When nothing above populated it — e.g. a broad,
+    # delivery-related regression where the rest of the site ALSO rose (positive
+    # residual, which Fix E deliberately leaves silent) — add one honest,
+    # number-free line so the section is never empty.
+    if not sec["What Did Not Change"]:
+        deliv = (findings.get("delivery") or {}).get("verdict")
+        cov = findings.get("coverage") or {}
+        broad = cov.get("coverage_ratio") is not None and not cov.get("sufficient")
+        if deliv == "degraded" and bool(findings.get("delivery_relevant", True)):
+            sec["What Did Not Change"].append(
+                "This regression sits in the delivery layer (CDN/origin), which affects page types "
+                "broadly rather than sparing a specific area.")
+        elif broad:
+            sec["What Did Not Change"].append(
+                "The change is broadly distributed across many small page types rather than confined "
+                "to a few, so there is no distinct unaffected area to call out.")
+        else:
+            sec["What Did Not Change"].append(
+                "The remaining movement is spread thinly across smaller page types, with no distinct "
+                "unaffected area to highlight.")
     return {k: v for k, v in sec.items() if v}
 
 
