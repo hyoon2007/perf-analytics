@@ -14,9 +14,11 @@ processed/
 failed/
 .state/
 reports/
+test_reports/
 data/
 config/*.conf
 config/*.bak
 *.bak
 notebooks/report_preview*.html
 to-do.md
+.claude/settings.local.json
