@@ -661,7 +661,8 @@ def new_segment_focus_share(seg_df, new_segments, label_col="label"):
 def select_focus_segments(primary_movers, overall_win, dim,
                           min_share_pp=1.0, min_p75_delta=80,
                           min_anom_share=1.5, max_focus=3,
-                          min_contribution_ratio=0.15, min_contribution_abs=15.0):
+                          min_contribution_ratio=0.15, min_contribution_abs=15.0,
+                          other_label="other"):
     """v4: return a LIST of problem segments, not one. A segment qualifies if
     EITHER (a) it is slower-than-site AND gained meaningful traffic share, OR
     (b) its own p75 degraded materially while carrying non-trivial traffic.
@@ -675,13 +676,24 @@ def select_focus_segments(primary_movers, overall_win, dim,
     tiny segment with a large *internal* p75 jump but negligible sitewide impact
     (e.g. a 2% section that even lost traffic) from being co-headlined next to the
     real driver with no explanation. Sub-threshold segments are summarized under
-    additional_segments instead of dropped."""
+    additional_segments instead of dropped.
+
+    v6.9.12 (Fix #3): the catch-all `other` bucket (groups beyond top_k) is NOT
+    a real page type — it is a grab-bag of many small pages — so it is never
+    promoted to a headline focus. A per-page role like "became slower on its
+    own" / "a real local regression to investigate directly" is meaningless for
+    it, and it was also being described a second time by the other_bucket_watch
+    note. Excluding it here removes both the mislabel and the duplication in one
+    place; its rise is still surfaced (correctly) via other_bucket_watch, and it
+    stays in the coverage residual so low coverage reads honestly."""
     share = {r["segment"]: r for r in primary_movers["share_movers"]}
     perf = {r["segment"]: r for r in primary_movers["perf_movers"]}
     universe = {**perf, **share}     # union of both mover views
 
     picked = {}
     for seg, r in universe.items():
+        if str(seg) == other_label:
+            continue                 # catch-all bucket; surfaced via other_bucket_watch
         gained_share = (r["share_delta_pp"] >= min_share_pp and r.get("slow_segment"))
         self_regressed = (r["p75_delta_ms"] >= min_p75_delta
                           and r["share_anomaly_pct"] >= min_anom_share)
@@ -1306,7 +1318,10 @@ def render_fallback_report(f):
         if extra:
             lines.append(f"- Plus {extra} more page type(s) with smaller contributions.")
     else:
-        for mv in f["segments"]["primary_share_movers"][:3]:
+        # v6.9.12 (Fix #3): skip the catch-all 'other' bucket here too — when no
+        # real page type qualifies as focus, don't list 'other' as a pseudo-page;
+        # its rise is covered by the other_watch note below.
+        for mv in [m for m in f["segments"]["primary_share_movers"] if str(m["segment"]) != "other"][:3]:
             lines.append(f"- {from_token(mv['segment'])}: traffic share "
                          f"{fmt_pct(mv['share_normal_pct'])} to {fmt_pct(mv['share_anomaly_pct'])}; "
                          f"p75 {fmt_ms(mv['p75_normal'])} to {fmt_ms(mv['p75_anomaly'])}")
