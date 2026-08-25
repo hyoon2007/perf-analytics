@@ -2273,9 +2273,33 @@ def build_narrative_facts(findings):
                 f"across many smaller page types and finer sub-segments (country, network, device) — "
                 f"consistent with the composition split above.")
 
-    # v6.7: concrete resolution criteria instead of generic monitoring advice
+    # v6.7: concrete resolution criteria instead of generic monitoring advice.
+    # v6.9.12 (Fix #4): make the clear-condition match the verdict. For a
+    # delivery_regression the cause is CDN/origin, so the alert clears when the
+    # DEGRADED DELIVERY SIGNALS recover — not when a page type's share normalizes.
     fl = findings.get("segments", {}).get("focus_list") or []
-    if fl:
+    verdict_code = (findings.get("verdict") or {}).get("code")
+    if verdict_code == "delivery_regression":
+        _DELIV_LABELS = {
+            "origintime": "origin response time",
+            "edgetime": "edge (CDN) response time",
+            "cdncacherate": "CDN cache hit rate",
+            "origin_traffic_share": "the share of requests hitting origin (offload)",
+        }
+        metric_name = (findings.get("meta") or {}).get("metric", "the metric")
+        issues = (findings.get("delivery") or {}).get("issues") or []
+        named = [_DELIV_LABELS.get(i, i) for i in issues]
+        if len(named) > 1:
+            signals = ", ".join(named[:-1]) + " and " + named[-1]
+        elif named:
+            signals = named[0]
+        else:
+            signals = "CDN/origin response time and cache offload"
+        facts["monitoring"] = (
+            f"The alert should clear as the degraded delivery signals ({signals}) return to "
+            f"their normal range; if delivery recovers but {metric_name} stays elevated, "
+            f"re-investigate at the page level.")
+    elif fl:
         r0 = fl[0]
         facts["monitoring"] = (
             f"The alert should clear as {page_token(r0['segment'])} returns toward its "
