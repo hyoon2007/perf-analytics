@@ -319,7 +319,8 @@ def delivery_health(df, label_col="label", tol_pct=15,
         m0 = float(df.loc[df[label_col] == 0, m].median())
         m1 = float(df.loc[df[label_col] == 1, m].median())
         res["metrics"][m] = {"normal_median": round(m0, 1),
-                             "anomaly_median": round(m1, 1)}
+                             "anomaly_median": round(m1, 1),
+                             "delta": round(m1 - m0, 1)}
         worse = (m1 > m0 * (1 + tol_pct / 100)) if m != "cdncacherate" \
             else (m1 < m0 * (1 - tol_pct / 100))
         base_floor = 20 if m != "cdncacherate" else 0
@@ -329,7 +330,8 @@ def delivery_health(df, label_col="label", tol_pct=15,
         o0 = float((df.loc[df[label_col] == 0, origin_flag_col] == "Y").mean()) * 100
         o1 = float((df.loc[df[label_col] == 1, origin_flag_col] == "Y").mean()) * 100
         res["metrics"]["origin_traffic_share_pct"] = {
-            "normal_median": round(o0, 1), "anomaly_median": round(o1, 1)}
+            "normal_median": round(o0, 1), "anomaly_median": round(o1, 1),
+            "delta": round(o1 - o0, 1)}
         if o1 > o0 + 5:
             res["issues"].append("origin_traffic_share")
     res["verdict"] = "degraded" if res["issues"] else "clean"
@@ -1325,6 +1327,11 @@ def render_fallback_report(f):
             lines.append(f"- {from_token(mv['segment'])}: traffic share "
                          f"{fmt_pct(mv['share_normal_pct'])} to {fmt_pct(mv['share_anomaly_pct'])}; "
                          f"p75 {fmt_ms(mv['p75_normal'])} to {fmt_ms(mv['p75_anomaly'])}")
+    # v6.9.13: for a delivery_regression, print the CDN/origin numbers (origin/edge
+    # time, offload) that drove the verdict — same evidence block as the LLM path.
+    _dev = delivery_evidence_line(f)
+    if _dev:
+        lines.append(f"- {_dev}")
     b=f.get("behavior", {})
     if b.get("new_visitor_influx"):
         lines.append(f"- Audience indicator (new visitors, not a cause): session-entry "
@@ -2435,6 +2442,12 @@ def build_section_facts(findings):
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
+    # v6.9.13: for a delivery_regression, show the actual CDN/origin numbers that
+    # drove the verdict (origin/edge time, offload) — previously named but never
+    # quantified anywhere in the report.
+    _dev = delivery_evidence_line(findings)
+    if _dev:
+        sec["What Changed"].append(_dev)
     for key in ("focus_growth", "new_segment", "notable_shift", "decomposition",
                 "decomposition_support", "decomposition_caveat", "audience", "client_side", "coverage"):
         if key in flat:
@@ -2530,6 +2543,61 @@ def fmt_ms(v):
 def fmt_pct(v):
     v = float(v)
     return f"{v:.0f}%" if abs(v - round(v)) < 0.05 else f"{v:.1f}%"
+
+_DELIV_EVIDENCE_LABELS = {
+    "origintime": "origin response time",
+    "edgetime": "edge (CDN) response time",
+    "cdncacherate": "CDN cache hit rate",
+    "origin_traffic_share_pct": "origin traffic share (offload)",
+}
+
+def delivery_evidence_line(findings):
+    """v6.9.13: for a delivery_regression, surface the actual CDN/origin numbers
+    (normal -> anomaly) as 'What Changed' sub-line(s). These signals drive the
+    verdict but were previously never printed — only named qualitatively — so a
+    real move like origin offload dropping (origin traffic share rising) stayed
+    invisible. Shows every degraded response-time metric PLUS origin traffic
+    share always (the offload shift is the key delivery diagnostic, worth showing
+    even when it did not itself cross the flag threshold). Returns "" when the
+    verdict is not a delivery regression or no delivery numbers are available.
+
+    All medians and deltas come straight from findings.delivery.metrics, so they
+    are already in the number whitelist (collect_numbers walks findings). The
+    response-time and offload halves are emitted as SEPARATE sentences on
+    purpose: the number-binding validator triggers on the words 'share'/'traffic'
+    /'cache', so a millisecond value must never share a sentence with them. The
+    response-time sentence carries no trigger word (its numbers are skipped by the
+    binding check), and the offload sentence carries only percentage values that
+    legitimately bind to 'share'/'cache'."""
+    if (findings.get("verdict") or {}).get("code") != "delivery_regression":
+        return ""
+    metrics = (findings.get("delivery") or {}).get("metrics") or {}
+    issues = set((findings.get("delivery") or {}).get("issues") or [])
+    time_clauses, offload_clauses = [], []
+    for m in ("origintime", "edgetime"):
+        v = metrics.get(m)
+        if v and m in issues:
+            n, a = v["normal_median"], v["anomaly_median"]
+            d = v.get("delta", round(a - n, 1))
+            time_clauses.append(f"{_DELIV_EVIDENCE_LABELS[m]} {fmt_ms(n)} → {fmt_ms(a)} ({d:+g} ms)")
+    # Offload only. cdncacherate is deliberately excluded: it is beacon-derived
+    # and unreliable (values can be nonsensical, e.g. >100%), and the user asked
+    # specifically for origin/edge time and the origin (offload) ratio. The CDN
+    # cache caveat is still handled by the existing cdn_caveat lines elsewhere.
+    v = metrics.get("origin_traffic_share_pct")
+    if v:
+        n, a = v["normal_median"], v["anomaly_median"]
+        d = v.get("delta", round(a - n, 1))
+        offload_clauses.append(
+            f"{_DELIV_EVIDENCE_LABELS['origin_traffic_share_pct']} "
+            f"{fmt_pct(n)} → {fmt_pct(a)} ({d:+g}pp)")
+    parts = []
+    if time_clauses:
+        parts.append("Delivery evidence — response times (normal → anomaly): "
+                     + "; ".join(time_clauses) + ".")
+    if offload_clauses:
+        parts.append("Offload (normal → anomaly): " + "; ".join(offload_clauses) + ".")
+    return " ".join(parts)
 
 def fmt_num(v):
     v = float(v)
