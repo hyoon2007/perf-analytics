@@ -2747,6 +2747,22 @@ def humanize_region(code):
     return REGION_NAMES.get(c, str(code))
 
 
+def _visible_segments(findings):
+    """Segment values actually NAMED in the 'What Changed' body — across every
+    dimension (page type, country, ISP, device, network). v6.9.12 (Fix #2): a
+    hypothesis may only name a specific value if the reader can see it here, so
+    it never asserts, say, a country pulled from the loose focus drilldown that
+    the strict focus_breakdown gate (grew AND slower AND material) filtered out.
+    Generalised beyond country: any future drilldown-sourced naming uses the
+    same gate, so the inconsistency cannot recur on another field."""
+    vis = set()
+    for b in (findings.get("focus_breakdown") or []):
+        vis.add(str(b.get("segment")))
+    for s in (findings.get("new_segments") or []):
+        vis.add(str(s.get("segment")))
+    return vis
+
+
 def derive_hypotheses(findings):
     """Findings-consistent external explanations. Deterministic seeds the LLM
     may phrase; each is explicitly a hypothesis, never asserted as fact."""
@@ -2754,12 +2770,13 @@ def derive_hypotheses(findings):
     beh = findings.get("behavior", {})
     if beh.get("new_visitor_influx"):
         where = ""
-        dd = findings.get("segments", {}).get("drilldown", {}).get("country")
-        if dd:
-            gainers = [r for r in dd if r.get("share_delta_pp", 0) > 1]
-            if gainers:
-                names = [humanize_region(r["segment"]) for r in gainers[:2]]
-                where = " concentrated in " + " and ".join(names)
+        # v6.9.12 (Fix #2): only name a country the body actually shows.
+        vis = _visible_segments(findings)
+        dd = findings.get("segments", {}).get("drilldown", {}).get("country") or []
+        gainers = [r for r in dd if r.get("share_delta_pp", 0) > 1 and str(r["segment"]) in vis]
+        if gainers:
+            names = [humanize_region(r["segment"]) for r in gainers[:2]]
+            where = " concentrated in " + " and ".join(names)
         hyps.append("A marketing campaign or product-announcement event drove "
                     "a burst of first-time visitors" + where + ", which arrive "
                     "with empty browser caches and therefore slower first loads.")
