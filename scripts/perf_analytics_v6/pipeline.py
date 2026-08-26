@@ -2573,7 +2573,7 @@ def delivery_evidence_line(findings):
         return ""
     metrics = (findings.get("delivery") or {}).get("metrics") or {}
     issues = set((findings.get("delivery") or {}).get("issues") or [])
-    time_clauses, offload_clauses = [], []
+    time_clauses = []
     for m in ("origintime", "edgetime"):
         v = metrics.get(m)
         if v and m in issues:
@@ -2585,18 +2585,19 @@ def delivery_evidence_line(findings):
     # specifically for origin/edge time and the origin (offload) ratio. The CDN
     # cache caveat is still handled by the existing cdn_caveat lines elsewhere.
     v = metrics.get("origin_traffic_share_pct")
+    offload_sentence = ""
     if v:
         n, a = v["normal_median"], v["anomaly_median"]
         d = v.get("delta", round(a - n, 1))
-        offload_clauses.append(
-            f"{_DELIV_EVIDENCE_LABELS['origin_traffic_share_pct']} "
-            f"{fmt_pct(n)} → {fmt_pct(a)} ({d:+g}pp)")
+        # Plain 'origin traffic share' — no repeated '(offload)' tag.
+        offload_sentence = (f"Origin traffic share (normal → anomaly): "
+                            f"{fmt_pct(n)} → {fmt_pct(a)} ({d:+g}pp).")
     parts = []
     if time_clauses:
         parts.append("Delivery evidence — response times (normal → anomaly): "
                      + "; ".join(time_clauses) + ".")
-    if offload_clauses:
-        parts.append("Offload (normal → anomaly): " + "; ".join(offload_clauses) + ".")
+    if offload_sentence:
+        parts.append(offload_sentence)
     return " ".join(parts)
 
 def fmt_num(v):
