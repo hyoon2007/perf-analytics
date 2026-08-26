@@ -1340,11 +1340,15 @@ def render_fallback_report(f):
         lines.append(f"- {_dev}")
     b=f.get("behavior", {})
     if b.get("new_visitor_influx"):
-        lines.append(f"- Audience indicator (new visitors, not a cause): session-entry "
-                     f"share {fmt_pct(b['normal']['landing_share_pct'])} to "
-                     f"{fmt_pct(b['anomaly']['landing_share_pct'])}, browser cache hit rate median "
-                     f"{fmt_pct(b['normal']['client_cacherate_median'])} to "
-                     f"{fmt_pct(b['anomaly']['client_cacherate_median'])}")
+        # v6.9.14: collapse an equal-endpoint move to a single value (e.g. a
+        # section with no cache data reads "0% to 0%") rather than a no-op range.
+        _ls_n,_ls_a=fmt_pct(b['normal']['landing_share_pct']),fmt_pct(b['anomaly']['landing_share_pct'])
+        _cr_n,_cr_a=fmt_pct(b['normal']['client_cacherate_median']),fmt_pct(b['anomaly']['client_cacherate_median'])
+        _share=(f"session-entry share steady at {_ls_n}" if _ls_n==_ls_a
+                else f"session-entry share {_ls_n} to {_ls_a}")
+        _cache=(f"browser cache hit rate median steady at {_cr_n}" if _cr_n==_cr_a
+                else f"browser cache hit rate median {_cr_n} to {_cr_a}")
+        lines.append(f"- Audience indicator (new visitors, not a cause): {_share}, {_cache}")
     cov=f.get("coverage")
     if cov and not cov.get("sufficient"):
         lines.append(f"- Coverage note: at the page-type level the sections above localise "
@@ -1368,10 +1372,19 @@ def render_fallback_report(f):
             lines.append("- The CDN cache hit rate here is derived from client beacons and "
                          "may differ from the actual cache hit rate reported by the CDN; "
                          "use it for reference only.")
-    if f.get("localization", {}).get("localized"):
-        ex=f["localization"]["excluded_p75"]
-        lines.append(f"- Excluding the focus section(s), sitewide p75 moved from "
-                     f"{fmt_ms(ex[0])} to {fmt_ms(ex[1])}.")
+    # v6.9.14: localization is None whenever there is no focus segment (an
+    # improved verdict, or a within-regression that no single page type localises)
+    # — a legitimate state, so `.get(..., {})` is not enough (the key is present
+    # and None). Guard with `or {}`. Also collapse the equal-endpoint case to a
+    # single value so it never reads as "moved from X to X".
+    _loc=f.get("localization") or {}
+    if _loc.get("localized"):
+        ex=_loc["excluded_p75"]
+        _x0,_x1=fmt_ms(ex[0]),fmt_ms(ex[1])
+        if _x0==_x1:
+            lines.append(f"- Excluding the focus section(s), sitewide p75 held steady at {_x0}.")
+        else:
+            lines.append(f"- Excluding the focus section(s), sitewide p75 moved from {_x0} to {_x1}.")
     # v6.9.12 (Fix #1): the deterministic fallback builds this section on its own,
     # so it needs the same never-empty guard as build_section_facts.
     if len(lines) == _wdnc_start:
@@ -2098,9 +2111,15 @@ def build_narrative_facts(findings):
             cache_note = ""
             if n.get("client_cacherate_median") is not None:
                 # cache hit rate is a percentage (upstream sends values <= 100)
-                cache_note = (f", and the median browser cache hit rate from "
-                              f"{fmt_pct(n['client_cacherate_median'])} to "
-                              f"{fmt_pct(a.get('client_cacherate_median', 0))}")
+                # v6.9.14: when both windows format to the same value (e.g. a
+                # section with no cache data reads 0%), say "held at X" rather
+                # than "from X to X" — the latter is a no-op comparison our own
+                # degenerate-comparison gate rejects, deadlocking the LLM loop.
+                _cr_n=fmt_pct(n['client_cacherate_median'])
+                _cr_a=fmt_pct(a.get('client_cacherate_median', 0))
+                cache_note = (f", and the median browser cache hit rate held at {_cr_n}"
+                              if _cr_n==_cr_a else
+                              f", and the median browser cache hit rate from {_cr_n} to {_cr_a}")
             # v6.9.1: these audience figures are computed on the FOCUS section, not
             # the whole site — label the scope so the numbers are not mistaken for
             # sitewide values (e.g. the section cache median differs from sitewide).
@@ -2108,9 +2127,11 @@ def build_narrative_facts(findings):
             scoped = bool(scope_seg and scope_seg != "overall")
             scope_prefix = f"Within {page_token(scope_seg)}, " if scoped else ""
             subject = "session-entry page views" if scope_prefix else "Session-entry page views"
+            # v6.9.14: same equal-endpoint guard as the cache clause above.
+            _ls_n=fmt_pct(n['landing_share_pct']); _ls_a=fmt_pct(a['landing_share_pct'])
+            _move=(f"held at {_ls_n}" if _ls_n==_ls_a else f"moved from {_ls_n} to {_ls_a}")
             facts["audience"] = (
-                f"{scope_prefix}{subject} moved from {fmt_pct(n['landing_share_pct'])} to "
-                f"{fmt_pct(a['landing_share_pct'])}{cache_note}, an indicator of more "
+                f"{scope_prefix}{subject} {_move}{cache_note}, an indicator of more "
                 f"first-time visitors, not a cause of the slowdown.")
         elif not (findings.get("focus_breakdown")):
             # signal did not fire AND no sub-segment composition shift → state
@@ -2218,10 +2239,19 @@ def build_narrative_facts(findings):
         if r.get("self_regressed") and _os and _os["delta"] >= 5:
             _os_txt = (f" Its own origin traffic share rose from {fmt_pct(_os['normal'])} to "
                        f"{fmt_pct(_os['anomaly'])} ({_os['delta']:+g}pp) in the same window.")
+        # v6.9.14: collapse equal-endpoint clauses to a single value (a
+        # self-regressed page can hold its traffic share, giving "from 2.2% to
+        # 2.2%") so the pre-written fact never trips our degenerate-comparison
+        # gate and deadlocks the LLM loop.
+        _sh_n,_sh_a=fmt_pct(r['share_normal_pct']),fmt_pct(r['share_anomaly_pct'])
+        _p_n,_p_a=fmt_ms(r['p75_normal']),fmt_ms(r['p75_anomaly'])
+        _share_clause=(f"held at {_sh_n} of traffic" if _sh_n==_sh_a
+                       else f"moved from {_sh_n} to {_sh_a} of traffic")
+        _p75_clause=(f"unchanged at {_p_n}" if _p_n==_p_a
+                     else f"going from {_p_n} to {_p_a}")
         facts[f"section::{r['segment']}"] = (
-            f"{page_token(r['segment'])} moved from {fmt_pct(r['share_normal_pct'])} to "
-            f"{fmt_pct(r['share_anomaly_pct'])} of traffic, with its own p75 going from "
-            f"{fmt_ms(r['p75_normal'])} to {fmt_ms(r['p75_anomaly'])}{role}{_os_txt}")
+            f"{page_token(r['segment'])} {_share_clause}, with its own p75 "
+            f"{_p75_clause}{role}{_os_txt}")
 
     # v6.9.5: for a genuinely-regressed page type, did the PAGE get heavier
     # (content/third-party) or stay the same weight (execution/infra)?
@@ -2502,10 +2532,17 @@ def build_section_facts(findings):
     loc = findings.get("localization") or {}
     if loc.get("localized") and loc.get("excluded_p75"):
         e = loc["excluded_p75"]
-        direction = "improved slightly" if e[1] < e[0] else "held steady"
-        sec["What Did Not Change"].append(
-            f"Excluding the focus section, sitewide p75 {direction}, moving from "
-            f"{fmt_ms(e[0])} to {fmt_ms(e[1])}.")
+        # v6.9.14: when the excluded p75 is unchanged both windows format to the
+        # same value; state it once ("held steady at X") rather than "moving from
+        # X to X", which our own degenerate-comparison gate rejects.
+        _e0,_e1=fmt_ms(e[0]),fmt_ms(e[1])
+        if _e0==_e1:
+            sec["What Did Not Change"].append(
+                f"Excluding the focus section, sitewide p75 held steady at {_e0}.")
+        else:
+            direction = "improved slightly" if e[1] < e[0] else "held steady"
+            sec["What Did Not Change"].append(
+                f"Excluding the focus section, sitewide p75 {direction}, moving from {_e0} to {_e1}.")
     else:
         # v6.9.11 (Fix E): when localization did not already state the rest-of-site
         # behaviour, state it from the coverage residual. Otherwise "What Did Not
