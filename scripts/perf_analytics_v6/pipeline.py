@@ -2716,7 +2716,11 @@ AKAMAI_PLAYBOOK = [
     },
     {
         "id": "third_party_release_audit",
-        "applies_to": ["lcp", "fcp", "ttfb", "tbt"],
+        # v6.9.13: NOT ttfb. TTFB (Waiting Time) is a pre-render delivery metric
+        # (delivery_first, resource_focus=[]), so third-party tags / resource
+        # waterfall / front-end release — all POST-first-byte — cannot move it;
+        # its within-regressions are covered by delivery_investigate instead.
+        "applies_to": ["lcp", "fcp", "tbt"],
         "when": ["within_regression.within_regression == true",
                  "traffic_source_suspect == false"],
         "levers": ["Script Management / third-party tag review",
