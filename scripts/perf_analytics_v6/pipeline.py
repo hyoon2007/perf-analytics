@@ -1315,6 +1315,12 @@ def render_fallback_report(f):
             role=("gained share and slowed on its own" if r.get("gained_share") and r.get("self_regressed")
                   else "grew its share of traffic" if r.get("gained_share")
                   else "became slower on its own")
+            # v6.9.13: when this page slowed on its own and its origin share rose
+            # >= 5pp, show that page's offload move right on its focus line.
+            _os = r.get("origin_share")
+            if r.get("self_regressed") and _os and _os["delta"] >= 5:
+                bits.append(f"origin share {fmt_pct(_os['normal'])} → {fmt_pct(_os['anomaly'])} "
+                            f"({_os['delta']:+g}pp)")
             lines.append(f"- {tok} ({role}): " + "; ".join(bits))
         extra=f["segments"].get("additional_count", 0)
         if extra:
@@ -2204,10 +2210,18 @@ def build_narrative_facts(findings):
         else:
             role = (" — holding its own internal mix constant it did not genuinely slow "
                     "down; the p75 move reflects a shift in its internal traffic mix.")
+        # v6.9.13: a page that slowed on its own with a >= 5pp rise in its own
+        # origin share — surface that offload move (own sentence keeps the pct
+        # values away from the ms number-binding on the p75 clause).
+        _os = r.get("origin_share")
+        _os_txt = ""
+        if r.get("self_regressed") and _os and _os["delta"] >= 5:
+            _os_txt = (f" Its own origin traffic share rose from {fmt_pct(_os['normal'])} to "
+                       f"{fmt_pct(_os['anomaly'])} ({_os['delta']:+g}pp) in the same window.")
         facts[f"section::{r['segment']}"] = (
             f"{page_token(r['segment'])} moved from {fmt_pct(r['share_normal_pct'])} to "
             f"{fmt_pct(r['share_anomaly_pct'])} of traffic, with its own p75 going from "
-            f"{fmt_ms(r['p75_normal'])} to {fmt_ms(r['p75_anomaly'])}{role}")
+            f"{fmt_ms(r['p75_normal'])} to {fmt_ms(r['p75_anomaly'])}{role}{_os_txt}")
 
     # v6.9.5: for a genuinely-regressed page type, did the PAGE get heavier
     # (content/third-party) or stay the same weight (execution/infra)?
@@ -3239,6 +3253,18 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # device / paid shift is NOT called 'the page slowed on its own').
     for _r in focus_list:
         _seg_df = df[df[PRIMARY_DIM].astype(str) == _r["segment"]]
+        # v6.9.13: this focus page's OWN origin offload — the share of its requests
+        # that hit origin, normal vs anomaly. Surfaced on the focus line only when
+        # the page slowed on its own AND its origin share rose materially, so a
+        # page-level TTFB regression can point at that page's own offload drop.
+        if "origin_flag" in _seg_df:
+            _m0, _m1 = _seg_df[LABEL_COL] == 0, _seg_df[LABEL_COL] == 1
+            if _m0.any() and _m1.any():
+                _os0 = float((_seg_df.loc[_m0, "origin_flag"] == "Y").mean()) * 100
+                _os1 = float((_seg_df.loc[_m1, "origin_flag"] == "Y").mean()) * 100
+                _r["origin_share"] = {"normal": round(_os0, 1),
+                                      "anomaly": round(_os1, 1),
+                                      "delta": round(_os1 - _os0, 1)}
         _split = focus_regression_split(_seg_df, TIMER_COL, LABEL_COL, abs_floor_ms=EFFECT_FLOOR_MS)
         _r["genuine_regression"] = _split["genuine_regression"]
         _r["subcomp_mix_ms"] = _split["mix_effect_ms"]
