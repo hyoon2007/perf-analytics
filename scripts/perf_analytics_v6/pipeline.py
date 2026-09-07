@@ -2946,10 +2946,30 @@ def derive_hypotheses(findings):
                     "load time independently of the traffic shift.")
     cov = findings.get("coverage")
     if cov and not cov.get("sufficient"):
+        # v6.9.14 (P2): "broadly distributed" is a LOCATION fact (coverage). The
+        # MECHANISM (composition shift vs genuine slowdown) must be read from the
+        # decomposition, not assumed — otherwise this hypothesis can claim a
+        # "composition shift" while the mix/within split says the change is mostly
+        # a genuine within-regression. Describe the spread; read the cause.
+        _dec = findings.get("decomposition") or {}
+        _mix = abs(_dec.get("mix_effect_ms", 0) or 0)
+        _win = abs(_dec.get("within_effect_ms", 0) or 0)
+        _tot = _mix + _win
+        _wf = (_win / _tot) if _tot > 1e-9 else None
+        if _wf is not None and _wf >= 0.60:
+            _cause = ("the decomposition attributes it mostly to segments genuinely "
+                      "slowing (not composition), so the likely driver is a broad "
+                      "slowdown across many pages — a delivery/origin regression or a "
+                      "release touching many page types; verify against release and "
+                      "origin timing.")
+        elif _wf is not None and _wf <= 0.40:
+            _cause = ("a wide composition shift (or a release touching many page types) "
+                      "is the likely driver; verify against release timing.")
+        else:
+            _cause = ("both a composition shift and genuine slowdown contribute across "
+                      "many pages; verify against release and origin timing.")
         hyps.append("Most of the change is broadly distributed rather than "
-                    "localised to the named page types — a wide composition shift "
-                    "(or a release touching many page types) is the likely driver; "
-                    "verify against release timing.")
+                    "localised to the named page types — " + _cause)
     return hyps
 
 
