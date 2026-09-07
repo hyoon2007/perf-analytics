@@ -1390,9 +1390,17 @@ def render_fallback_report(f):
     if len(lines) == _wdnc_start:
         _cov = f.get("coverage") or {}
         _broad = _cov.get("coverage_ratio") is not None and not _cov.get("sufficient")
+        # v6.9.14 (P3): mirror build_section_facts — no "spared no specific area"
+        # when genuine per-page regressions are named.
+        _genuine_focus = any(r.get("genuine_regression")
+                             for r in (f.get("segments", {}).get("focus_list") or []))
         if _deliv.get("verdict") == "degraded" and bool(f.get("delivery_relevant", True)):
-            lines.append("- This regression sits in the delivery layer (CDN/origin), which affects "
-                         "page types broadly rather than sparing a specific area.")
+            if _genuine_focus:
+                lines.append("- No specific area was spared: the delivery layer (CDN/origin) slowed "
+                             "broadly, and the named page types slowed further on their own on top of that.")
+            else:
+                lines.append("- This regression sits in the delivery layer (CDN/origin), which affects "
+                             "page types broadly rather than sparing a specific area.")
         elif _broad:
             lines.append("- The change is broadly distributed across many small page types rather than "
                          "confined to a few, so there is no distinct unaffected area to call out.")
@@ -2589,10 +2597,19 @@ def build_section_facts(findings):
         deliv = (findings.get("delivery") or {}).get("verdict")
         cov = findings.get("coverage") or {}
         broad = cov.get("coverage_ratio") is not None and not cov.get("sufficient")
+        # v6.9.14 (P3): don't claim delivery "spared no specific area" when the
+        # report has named genuine per-page regressions — that contradicts them.
+        genuine_focus = any(r.get("genuine_regression")
+                            for r in (findings.get("segments", {}).get("focus_list") or []))
         if deliv == "degraded" and bool(findings.get("delivery_relevant", True)):
-            sec["What Did Not Change"].append(
-                "This regression sits in the delivery layer (CDN/origin), which affects page types "
-                "broadly rather than sparing a specific area.")
+            if genuine_focus:
+                sec["What Did Not Change"].append(
+                    "No specific area was spared: the delivery layer (CDN/origin) slowed broadly, "
+                    "and the named page types slowed further on their own on top of that.")
+            else:
+                sec["What Did Not Change"].append(
+                    "This regression sits in the delivery layer (CDN/origin), which affects page types "
+                    "broadly rather than sparing a specific area.")
         elif broad:
             sec["What Did Not Change"].append(
                 "The change is broadly distributed across many small page types rather than confined "
