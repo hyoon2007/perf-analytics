@@ -2154,10 +2154,31 @@ def build_narrative_facts(findings):
             f"{bi['human_label']} ({fmt_pct(bi['share_normal_pct'])} to "
             f"{fmt_pct(bi['share_anomaly_pct'])} of that page type)" for bi in fb)
         abbr = (findings.get("meta") or {}).get("metric_abbrev", "TBT")
-        facts["focus_growth"] = (
-            f"Within {page_token(foc['segment'])}, the growth is concentrated in {parts} — "
-            f"all higher-{abbr} sub-segments, so the rise reflects a shift toward slower "
-            f"traffic on that page type rather than the page itself slowing down.")
+        # v6.9.14 (P1): the sub-segment breakdown DESCRIBES where this page's own
+        # traffic moved; the genuine-vs-mix VERDICT belongs only to the per-focus
+        # DFL split (the SAME signal the section role reads). So this line must
+        # agree with that role, never contradict it: read genuine_regression /
+        # genuine_regression_suppressed rather than re-deriving a verdict from the
+        # sub-segment shift alone. When the split found a genuine self-slowdown,
+        # the sub-segment shift is a contributor ON TOP of it (this also covers
+        # the ~40-60 case: it says the page slowed AND the mix moved), not an
+        # alternative that "explains it away".
+        if foc.get("genuine_regression_suppressed"):
+            facts["focus_growth"] = (
+                f"Within {page_token(foc['segment'])}, traffic shifted toward higher-{abbr} "
+                f"sub-segments ({parts}); combined with unbaselined new traffic this makes the "
+                f"page's own slowdown hard to confirm — see the traffic-source note.")
+        elif foc.get("genuine_regression"):
+            facts["focus_growth"] = (
+                f"Within {page_token(foc['segment'])}, traffic also shifted toward higher-{abbr} "
+                f"sub-segments ({parts}), which adds to its rise; but holding this page's internal "
+                f"mix constant it still slowed genuinely, so the sub-segment shift is a contributor, "
+                f"not the whole story.")
+        else:
+            facts["focus_growth"] = (
+                f"Within {page_token(foc['segment'])}, the growth is concentrated in {parts} — "
+                f"all higher-{abbr} sub-segments, so the rise reflects a shift toward slower "
+                f"traffic on that page type rather than the page itself slowing down.")
 
     # v6.9.1 improvement: absolute-severity context. The delta can be small while
     # the baseline is already catastrophic (e.g. TBT p75 far past the 'poor' band).
