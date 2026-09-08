@@ -2698,9 +2698,14 @@ def delivery_evidence_line(findings):
     if v:
         n, a = v["normal_median"], v["anomaly_median"]
         d = v.get("delta", round(a - n, 1))
+        # v6.9.14 (P6): a FALLING origin share in a delivery regression reads like
+        # good news (offload improved) next to a bad verdict — clarify that the
+        # slowdown is in per-request response time, not in more origin traffic.
+        _clar = (" — offload actually improved (fewer requests hit origin); the delivery "
+                 "slowdown is in per-request response time, not more origin traffic" if d < 0 else "")
         # Plain 'origin traffic share' — no repeated '(offload)' tag.
         offload_sentence = (f"Origin traffic share (normal → anomaly): "
-                            f"{fmt_pct(n)} → {fmt_pct(a)} ({d:+g}pp).")
+                            f"{fmt_pct(n)} → {fmt_pct(a)} ({d:+g}pp){_clar}.")
     parts = []
     if time_clauses:
         parts.append("Delivery evidence — response times (normal → anomaly): "
