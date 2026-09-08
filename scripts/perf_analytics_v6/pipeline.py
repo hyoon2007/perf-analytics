@@ -2052,6 +2052,17 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
             bugs.append(f"{key} has numbers outside the whitelist: {unknown}")
     return bugs
 
+def _reqcount_fell(rp, floor_pct=-15.0):
+    """v6.9.14 (P4): True + (normal, anomaly) medians when a focus page's request
+    count dropped materially. 'not heavier' includes 'materially lighter', so a
+    big drop must NOT be phrased as 'essentially the same page weight'."""
+    rc = (rp or {}).get("requestcount") or {}
+    dp = rc.get("delta_pct")
+    if dp is not None and dp <= floor_pct and "normal_median" in rc:
+        return True, rc["normal_median"], rc["anomaly_median"]
+    return False, None, None
+
+
 # ===================== v6.1: pre-rendered fact sentences =====================
 def build_narrative_facts(findings):
     """Python writes the sentences for every load-bearing figure; the model is
@@ -2299,10 +2310,19 @@ def build_narrative_facts(findings):
                 f"crossed the change threshold, so a content or third-party change is the likely "
                 f"cause; compare the resource waterfall between the two windows.")
         else:
-            facts[f"resource::{r['segment']}"] = (
-                f"{page_token(r['segment'])} carried essentially the same page weight{rc_txt}, so "
-                f"its slowdown points to execution/infrastructure (main-thread work or third-party "
-                f"scripts), not added page content.")
+            # v6.9.14 (P4): "not heavier" includes "materially lighter" — don't call
+            # a big request-count drop "essentially the same page weight".
+            _fell, _n, _a = _reqcount_fell(rp)
+            if _fell:
+                facts[f"resource::{r['segment']}"] = (
+                    f"{page_token(r['segment'])} did not get heavier — its request count actually fell "
+                    f"from {fmt_num(_n)} to {fmt_num(_a)} — so its slowdown points to execution/"
+                    f"infrastructure (main-thread work or third-party scripts), not added page content.")
+            else:
+                facts[f"resource::{r['segment']}"] = (
+                    f"{page_token(r['segment'])} carried essentially the same page weight{rc_txt}, so "
+                    f"its slowdown points to execution/infrastructure (main-thread work or third-party "
+                    f"scripts), not added page content.")
 
     # v6.9.5: a new / surging traffic segment with no baseline (e.g. a cloud-ISP
     # burst) — its impact can be mistaken for a per-page slowdown. v6.9.9: only
@@ -2890,8 +2910,13 @@ def local_regression_actions(findings):
             cause = (f"its page weight also rose ({detail}), so check for a content or "
                      f"third-party change")
         else:
-            cause = ("its page weight was unchanged, so the cause is execution-side "
-                     "(main-thread work or third-party scripts)")
+            _fell, _n, _a = _reqcount_fell(rp)
+            if _fell:
+                cause = (f"its request count actually fell (from {fmt_num(_n)} to {fmt_num(_a)}), so the "
+                         f"cause is execution-side (main-thread work or third-party scripts)")
+            else:
+                cause = ("its page weight was unchanged, so the cause is execution-side "
+                         "(main-thread work or third-party scripts)")
         acts.append({
             "id": f"local_regression_{r['segment']}",
             "levers": ["Script Management / third-party tag review", "release-change correlation"],
