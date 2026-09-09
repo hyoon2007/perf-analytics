@@ -2081,11 +2081,21 @@ def build_narrative_facts(findings):
         _tot, _stat = d["total_delta_ms"], d.get("stat", "p75")
         _mix, _win = d.get("mix_effect_ms", 0), d.get("within_effect_ms", 0)
         if _tot >= 0:
-            facts["decomposition"] = (
-                f"Across all traffic, of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes "
-                f"from a shift in traffic composition toward slower page/device/traffic-type mixes "
-                f"and only {fmt_ms(_win)} from segments genuinely slowing on their own (holding that "
-                f"mix constant); these two components add up to the whole change.")
+            # v6.9.14 (P7): don't hardcode "only" on the within part — it is often
+            # the LARGER of the two (e.g. 368 ms of a 392 ms rise). Emphasise
+            # whichever component dominates so "only" never labels the bigger share.
+            if abs(_win) >= abs(_mix):
+                facts["decomposition"] = (
+                    f"Across all traffic, of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes "
+                    f"from a shift in traffic composition toward slower page/device/traffic-type mixes, "
+                    f"and the larger part — {fmt_ms(_win)} — from segments genuinely slowing on their "
+                    f"own (holding that mix constant); these two components add up to the whole change.")
+            else:
+                facts["decomposition"] = (
+                    f"Across all traffic, of the {fmt_ms(_tot)} {_stat} increase, {fmt_ms(_mix)} comes "
+                    f"from a shift in traffic composition toward slower page/device/traffic-type mixes "
+                    f"and only {fmt_ms(_win)} from segments genuinely slowing on their own (holding that "
+                    f"mix constant); these two components add up to the whole change.")
         else:
             # v6.9.6: negative total = improvement; never call it an "increase".
             facts["decomposition"] = (
