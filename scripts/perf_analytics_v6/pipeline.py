@@ -2463,6 +2463,13 @@ def build_narrative_facts(findings):
         # a mix effect, matching the sub-segment breakdown that follows.
         gained, genuine = r.get("gained_share"), r.get("genuine_regression")
         _ov = r.get("new_traffic_overlap") or {}
+        # v6.9.21 (#3): describe the ACTUAL share direction from the measured delta,
+        # never assume "fell" because gained_share (>= MIN_SHARE_PP) is False — a
+        # small RISE below that threshold was being wrongly called a fall.
+        _sd = r.get("share_delta_pp")
+        _sdir = ("fell" if (_sd is not None and _sd < -0.5)
+                 else "rose slightly" if (_sd is not None and _sd > 0.5)
+                 else "held roughly steady")
         if r.get("genuine_regression_suppressed"):
             # v6.9.9: a new, unbaselined segment dominates this page's anomaly
             # traffic, so an apparent self-slowdown here cannot be confirmed.
@@ -2485,11 +2492,11 @@ def build_narrative_facts(findings):
             role = (" — it grew its share AND, holding its own internal traffic mix "
                     "constant, still slowed genuinely; investigate both.")
         elif genuine and not _within_mat_global:
-            role = (" — its own p75 rose while its share fell; site-wide the net own-change "
+            role = (f" — its own p75 rose while its share {_sdir}; site-wide the net own-change "
                     "is negligible (offset by other page types), so this is a secondary "
                     "signal rather than the main story.")
         elif genuine:
-            role = (" — its share fell yet, holding its own internal mix constant, it "
+            role = (f" — its share {_sdir}, and holding its own internal mix constant it "
                     "genuinely slowed — a real local regression to investigate directly.")
         elif gained:
             role = (" — its p75 rose mainly because it drew more of its own slower "
