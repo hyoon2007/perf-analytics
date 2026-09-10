@@ -690,7 +690,7 @@ def select_focus_segments(primary_movers, overall_win, dim,
                           min_share_pp=1.0, min_p75_delta=80,
                           min_anom_share=1.5, max_focus=3,
                           min_contribution_ratio=0.15, min_contribution_abs=15.0,
-                          other_label="other"):
+                          other_label="other", contribution_floor=None):
     """v4: return a LIST of problem segments, not one. A segment qualifies if
     EITHER (a) it is slower-than-site AND gained meaningful traffic share, OR
     (b) its own p75 degraded materially while carrying non-trivial traffic.
@@ -723,8 +723,17 @@ def select_focus_segments(primary_movers, overall_win, dim,
         if str(seg) == other_label:
             continue                 # catch-all bucket; surfaced via other_bucket_watch
         gained_share = (r["share_delta_pp"] >= min_share_pp and r.get("slow_segment"))
-        self_regressed = (r["p75_delta_ms"] >= min_p75_delta
-                          and r["share_anomaly_pct"] >= min_anom_share)
+        # v6.9.20 (Gate A): a page is a self-regression focus only if it CONTRIBUTES
+        # materially to the sitewide rise — i.e. its own p75 move weighted by its
+        # traffic share (small share needs a bigger move). Replaces the flat
+        # min_p75_delta so a big internal jump on a tiny page no longer headlines.
+        _contrib_ms = (r["share_anomaly_pct"] / 100.0) * max(r["p75_delta_ms"], 0)
+        if contribution_floor is not None:
+            self_regressed = (_contrib_ms >= contribution_floor
+                              and r["share_anomaly_pct"] >= min_anom_share)
+        else:
+            self_regressed = (r["p75_delta_ms"] >= min_p75_delta
+                              and r["share_anomaly_pct"] >= min_anom_share)
         if gained_share or self_regressed:
             # contribution proxy to sitewide p75 rise: share-growth pull + own worsening
             contrib = (max(r["share_delta_pp"], 0) / 100.0) * r["p75_normal"] \
@@ -2079,7 +2088,7 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
     return bugs
 
 def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
-                                 min_n=300, floor_ms=50.0):
+                                 min_n=300, floor_ms=50.0, contribution_floor=None):
     """v6.9.16 (Gap 3): generic scan for a segment VALUE (in any of `dims`, e.g.
     country / isp / deviceType) whose OWN metric p75 regressed materially — even
     when its traffic did NOT grow, which the mix / new-segment probes miss. No
@@ -2103,9 +2112,17 @@ def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
             if nn < min_n or na < min_n:
                 continue
             pn = _p75(df.loc[m_n, timer_col]); pa = _p75(df.loc[m_a, timer_col])
-            if not (pn == pn and pa == pa) or (pa - pn) < floor_ms:
+            if not (pn == pn and pa == pa):
                 continue
             sn = nn / tot_n * 100.0; sa = na / tot_a * 100.0
+            # v6.9.20 (Gate A): materiality by CONTRIBUTION (share x delta) so a
+            # small segment must move more to qualify; falls back to a flat delta
+            # floor when no contribution_floor is given.
+            if contribution_floor is not None:
+                if (sa / 100.0) * (pa - pn) < contribution_floor:
+                    continue
+            elif (pa - pn) < floor_ms:
+                continue
             out.append({"dim": dim, "segment": str(val),
                         "p75_normal": round(pn, 1), "p75_anomaly": round(pa, 1),
                         "delta_ms": round(pa - pn, 1),
@@ -3600,7 +3617,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # v4: select ALL qualifying problem sections, ranked by contribution
     focus_selection=select_focus_segments(primary_movers, win, PRIMARY_DIM,
                                           min_share_pp=MIN_SHARE_PP, min_p75_delta=SEVERITY_FLOOR_MS,
-                                          max_focus=MAX_FOCUS)
+                                          max_focus=MAX_FOCUS, contribution_floor=EFFECT_FLOOR_MS)
     focus_list=focus_selection["focus_list"]
     focus=focus_list[0] if focus_list else None          # primary, for localization/behavior drill
     focus_segments=[r["segment"] for r in focus_list]
@@ -3660,7 +3677,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # probes above miss. No value is hard-coded; every dim value is tested alike.
     segment_self_regressions = segment_self_regression_scan(
         df, ["country", "isp", "deviceType"], TIMER_COL, LABEL_COL,
-        min_n=MIN_SEG_N, floor_ms=SEVERITY_FLOOR_MS)
+        min_n=MIN_SEG_N, floor_ms=SEVERITY_FLOOR_MS, contribution_floor=EFFECT_FLOOR_MS)
     if segment_self_regressions:
         print("segment self-regressions:", [(s["dim"], s["segment"],
               f"{s['p75_normal']}->{s['p75_anomaly']}ms share {s['share_delta_pp']:+}pp") for s in segment_self_regressions[:5]])
