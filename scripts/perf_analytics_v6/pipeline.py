@@ -2448,6 +2448,13 @@ def build_narrative_facts(findings):
     # and soften the "investigate directly" tone — otherwise the headline
     # ("within -52 ms, no genuine slowdown") and the focus line contradict.
     _within_mat_global = bool((findings.get("materiality") or {}).get("within_material"))
+    # v6.9.20 (Gate C): do the NAMED focus pages actually explain the sitewide
+    # change? coverage removes them and re-measures the residual; if they explain
+    # <= ~15%, they moved internally but are NOT the driver — demote the
+    # "investigate directly" framing so it does not contradict the coverage note.
+    _cov_c = findings.get("coverage") or {}
+    _explains_little = (_cov_c.get("coverage_ratio") is not None
+                        and _cov_c.get("coverage_ratio") <= 0.15)
     for r in (findings.get("segments", {}).get("focus_list") or []):
         # v6.9.4: base the role on the composition-controlled split, not the raw
         # p75 delta. `genuine_regression` is True only when the section genuinely
@@ -2463,6 +2470,13 @@ def build_narrative_facts(findings):
                     f"{fmt_pct(_ov.get('focus_anom_share_pct', 0))} of this page's anomaly "
                     f"traffic) cannot be reweighted, so an apparent self-slowdown here is "
                     f"unconfirmed; verify the traffic source before treating it as a code regression.")
+        elif genuine and _explains_little:
+            # v6.9.20 (Gate C): it slowed on its own, but coverage shows the named
+            # pages barely explain the sitewide change — demote, don't say "investigate
+            # directly" (that would contradict the coverage note and the broad story).
+            role = (" — it slowed on its own, but removing it barely changes the site-wide "
+                    "p75, so this is part of the broad, site-wide change rather than a distinct "
+                    "page-level issue to chase.")
         elif genuine and gained and not _within_mat_global:
             role = (" — it grew its share AND its own p75 also rose; site-wide, though, "
                     "other page types' improvements offset this so the net own-change is "
