@@ -2194,24 +2194,33 @@ def component_attribution(df, timer_col="timer", label_col="label", floor_ms=50.
         res["waiting"] = _delta(pd.to_numeric(df[waiting_col], errors="coerce"))
     if uno_col in df:
         res["uno"] = _delta(pd.to_numeric(df[uno_col], errors="coerce"))
-    # INDEPENDENT, ADDITIVE layers of the metric rise (waiting is INSIDE backend,
-    # so comparing waiting vs backend as siblings would double-count it):
-    #   metric = backend + frontend ; backend = waiting(=delivery/first-byte) + server
-    #   => metric_delta = delivery(waiting) + server(backend-waiting) + frontend(metric-backend)
+    # INDEPENDENT, ADDITIVE layers of the metric rise. Per mPulse / Navigation
+    # Timing, the metric splits into three NON-OVERLAPPING spans (waiting is INSIDE
+    # backend, so comparing waiting vs backend as siblings would double-count it):
+    #   metric = backend + frontend ; backend = (backend - waiting) + waiting
+    #   => metric_delta = nav_overhead(backend-waiting) + delivery(waiting) + frontend(metric-backend)
+    #   - delivery      = waiting  = requestStart -> first byte = CDN + origin (first-byte/TTFB)
+    #   - nav_overhead  = backend - waiting = navigationStart -> requestStart = redirects, DNS,
+    #                     TCP, TLS, service worker/cache, client-hints (Critical-CH) restart, unload,
+    #                     and Unattributed Navigation Overhead (UNO). NOT server processing (that is
+    #                     inside waiting) — it is the pre-request browser/network overhead.
+    #   - frontend      = metric - backend = first byte -> paint = browser rendering
     bd = res["backend"]["delta"]
     fd = res["frontend"]["delta"]
     wd = res.get("waiting", {}).get("delta")
     layers = {}
     if wd is not None:
-        layers["delivery"] = round(wd, 1)                       # first-byte / TTFB
+        layers["delivery"] = round(wd, 1)                       # first-byte / TTFB (CDN + origin)
         if bd is not None:
-            layers["server"] = round(bd - wd, 1)               # backend after first byte
+            layers["nav_overhead"] = round(bd - wd, 1)         # pre-request overhead (redirect/DNS/TLS/conn/SW/UNO)
     elif bd is not None:
         layers["backend"] = round(bd, 1)                        # no waiting split available
     if fd is not None:
         layers["frontend"] = round(fd, 1)
     res["layers"] = layers
     material = {k: v for k, v in layers.items() if v >= floor_ms}
+    res["material_layers"] = material          # layers the narrative may name as (secondary) contributors
+    res["floor_ms"] = floor_ms
     if not material:
         res["cause"] = "broad"
     else:
@@ -2264,51 +2273,83 @@ def build_narrative_facts(findings):
                 f"from {fmt_pct(_t['share_normal_pct'])} to {fmt_pct(_t['share_anomaly_pct'])} — a genuine "
                 f"self-slowdown in this segment, not a traffic-mix effect.")
 
-    # v6.9.17 (Gap 2): which LAYER the paint-metric rise lives in (delivery /
-    # backend / frontend = metric-backend). Reads the single `cause` so the story
-    # can't send the reader to the wrong layer. No 'p75'/'share' keyword and only
-    # findings-sourced numbers, so it binds cleanly.
-    # v6.9.18 (Gap 2 fix): waiting is INSIDE backend, so the layers are the additive
-    # delivery(waiting) / server(backend-waiting) / frontend(metric-backend). Word
-    # each from the ACTUAL before->after values (never hard-code 'flat'); a broad,
-    # multi-layer rise is named as such instead of pinned on one layer.
+    # v6.9.17 (Gap 2): which LAYER the paint-metric rise lives in. Reads the single
+    # `cause` so the story can't send the reader to the wrong layer. No 'p75'/'share'
+    # keyword and only findings-sourced numbers, so it binds cleanly.
+    # v6.9.18 (Gap 2 fix): waiting is INSIDE backend, so the layers are additive.
+    # v6.9.23 (mPulse taxonomy fix): the three NON-OVERLAPPING layers are
+    #   delivery(waiting=CDN+origin) / pre-request overhead(backend-waiting=redirect,
+    #   DNS, TLS, connection, service worker, Critical-CH restart, UNO) / front-end
+    #   (metric-backend). Server processing lives INSIDE waiting, so backend-waiting is
+    #   NOT "server processing". Word every layer from its ACTUAL before->after (never
+    #   hard-code 'flat'), name the dominant layer as the cause, and honestly flag any
+    #   OTHER material layer as a secondary contributor.
     _ca = findings.get("component_attribution") or {}
     _cause = _ca.get("cause")
     def _cv(k):
         return _ca.get(k) or {}
     _wv, _bv, _fe = _cv("waiting"), _cv("backend"), _cv("frontend")
-    if _cause == "frontend":
-        facts["component_cause"] = (
-            f"The rise is in front-end rendering (the metric minus backend): front-end render time went "
-            f"from {fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])}, while first-byte (waiting) and "
-            f"backend time did not materially change and page weight did not grow — so this is a "
-            f"front-end issue, not delivery (CDN/origin) or backend.")
-    elif _cause == "delivery":
-        facts["component_cause"] = (
-            f"The rise is in first-byte time (waiting): it went from {fmt_ms(_wv['normal'])} to "
-            f"{fmt_ms(_wv['anomaly'])}, while backend processing and front-end rendering did not "
-            f"materially change — a delivery-layer (CDN/origin) issue.")
-    elif _cause == "server":
-        _uno = _cv("uno"); _extra = ""
-        if _uno.get("delta") is not None and _uno["delta"] >= 50:
-            _extra = (" Unattributed nav overhead (UNO) also rose, which points at audience/navigation "
-                      "factors (lower-end devices, external or missing referrers, more landing entries) "
-                      "rather than the site's own front-end code.")
-        # v6.9.21 (#1): label the server-side portion "Backend(TTFB) time" and do
-        # not print the first-byte (waiting) before/after separately — waiting is
-        # part of backend, so showing both confuses the reader.
-        facts["component_cause"] = (
-            f"The rise is in backend server processing (after first byte): Backend(TTFB) time went from "
-            f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])}, with first-byte time itself little "
-            f"changed.{_extra}")
-    elif _cause == "broad" and _fe.get("normal") is not None and _bv.get("normal") is not None:
-        # v6.9.21 (#1): Backend(TTFB) already includes first-byte, so show it +
-        # front-end only (no separate waiting line).
-        facts["component_cause"] = (
-            f"The rise spans multiple layers rather than one: Backend(TTFB) time went from "
-            f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])}, and front-end rendering (metric minus "
-            f"backend) from {fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])} — a broad slowdown, so no "
-            f"single layer is the whole story.")
+    _uno = _cv("uno")
+    _mat = _ca.get("material_layers") or {}
+    _floor = _ca.get("floor_ms") or 50
+    if _cause:
+        # primary-clause phrase per layer (only findings-sourced ms values)
+        def _phrase(layer):
+            if layer == "delivery":
+                return (f"first-byte time (delivery — CDN + origin) from "
+                        f"{fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])}")
+            if layer == "frontend":
+                return (f"front-end rendering from {fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])}")
+            # nav_overhead: the pre-request gap = Backend(TTFB) minus first-byte
+            return (f"pre-request overhead (redirects, DNS/TLS/connection, service worker, "
+                    f"client-hints restart, or unattributed nav overhead) — Backend(TTFB) went "
+                    f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])} while first-byte held near "
+                    f"{fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])}")
+        # secondary-clause phrase (shorter; "also rose")
+        def _sec(layer):
+            if layer == "delivery":
+                return (f"first-byte time (delivery) also rose "
+                        f"({fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])})")
+            if layer == "frontend":
+                return (f"front-end rendering also rose "
+                        f"({fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])})")
+            return (f"pre-request overhead also rose "
+                    f"(Backend(TTFB) {fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])})")
+        _tail = {
+            "delivery": "This is primarily a delivery (CDN/origin) issue.",
+            "frontend": "This is a front-end issue, not delivery (CDN/origin) or pre-request overhead.",
+            "nav_overhead": ("The extra time is before the request goes out (redirects, DNS/TLS/connection, "
+                             "service worker, client-hints restart), not the server response or front-end."),
+        }
+        _order = ["delivery", "nav_overhead", "frontend"]
+        # map each additive layer to the findings dict that carries its before/after
+        _ld = {"delivery": _wv, "frontend": _fe}
+        def _have(k):
+            if k == "nav_overhead":
+                return _bv.get("normal") is not None and _wv.get("normal") is not None
+            return _ld.get(k, {}).get("normal") is not None
+        if _cause == "broad":
+            _mats = [k for k in _order if k in _mat and _have(k)]
+            _body = "; ".join(_phrase(k) for k in _mats) if _mats else (
+                _phrase("delivery") if _have("delivery") else _phrase("frontend"))
+            facts["component_cause"] = ("The rise spans multiple layers rather than one: " + _body +
+                                        " — a broad slowdown, so no single layer is the whole story.")
+        elif _have(_cause):
+            _s = "The rise is mainly in " + _phrase(_cause) + "."
+            _secs = [k for k in _order if k != _cause and k in _mat and _have(k)]
+            if _secs:
+                _clause = "; ".join(_sec(k) for k in _secs)
+                _clause = _clause[0].upper() + _clause[1:]
+                _s += " " + _clause + (" — a smaller, secondary contributor."
+                                       if len(_secs) == 1 else " — smaller, secondary contributors.")
+            _tt = _tail.get(_cause, "")
+            if _cause == "nav_overhead" and _uno.get("delta") is not None and _uno["delta"] >= _floor:
+                _tt = ("Unattributed nav overhead (UNO) is elevated, which points at audience/navigation "
+                       "factors (lower-end devices, external or missing referrers, more landing entries) "
+                       "rather than the site's own front-end code.")
+            if _tt:
+                _s += " " + _tt
+            facts["component_cause"] = _s
     h = findings.get("headline", {})
     if h.get("transition_sentence"):
         facts["headline"] = h["transition_sentence"]
@@ -3205,7 +3246,7 @@ def route_actions_by_cause(findings, actions):
         scope = f"the {_lab} {_dw}"
     else:
         scope = "the affected segment"
-    nondelivery = cause in ("frontend", "server", "backend")   # first-byte is NOT the driver
+    nondelivery = cause in ("frontend", "nav_overhead", "backend")   # first-byte is NOT the driver
     out = []
     for a in actions:
         st = a.get("scope_tag")
@@ -3226,30 +3267,35 @@ def route_actions_by_cause(findings, actions):
             "levers": ["Script Management (defer/async, third-party tag audit)",
                        "EdgeWorkers (offload main-thread work)",
                        "front-end release / deploy correlation"],
-            "action": (f"Front-end rendering slowed for {scope}; first-byte (delivery) and backend time are "
-                       f"flat and page weight did not grow, so this is not a CDN/origin or backend issue. "
-                       f"Compare the resource waterfall and render-blocking resources between the two windows "
-                       f"scoped to {scope}, and check for a recent front-end release or third-party tag change "
+            "action": (f"Front-end rendering is the dominant layer for {scope} — more than delivery "
+                       f"(first-byte) or pre-request overhead — so start on the front end. Compare the "
+                       f"resource waterfall and render-blocking resources between the two windows scoped to "
+                       f"{scope}, and check for a recent front-end release or third-party tag change "
                        f"targeting it."),
             "scope_tag": "app_change"})
-    elif cause in ("server", "backend"):
+    elif cause in ("nav_overhead", "backend"):
+        # v6.9.23: backend-waiting is PRE-REQUEST overhead (redirects, DNS/TLS/connection,
+        # service worker, Critical-CH restart, UNO), NOT server processing (that lives in
+        # waiting/first-byte). Route on UNO: if UNO dominates it is audience/navigation;
+        # otherwise it is the pre-request network/browser steps, not the origin app.
         _uno = (ca.get("uno") or {}).get("delta")
         if _uno is not None and _uno >= 50:
             out.append({
                 "id": "backend_audience_audit",
                 "levers": ["referrer / landing-source review", "device-tier segmentation"],
-                "action": (f"Backend/server time rose for {scope} with elevated unattributed nav overhead "
-                           f"(UNO) while first-byte was flat — check for an influx of lower-end devices, "
-                           f"external or missing referrers, or more landing entries; this points at "
+                "action": (f"Pre-request overhead rose for {scope} with elevated unattributed nav overhead "
+                           f"(UNO) while first-byte (delivery) was flat — check for an influx of lower-end "
+                           f"devices, external or missing referrers, or more landing entries; this points at "
                            f"audience/navigation factors rather than the site's own front-end code."),
                 "scope_tag": "app_change"})
         else:
             out.append({
-                "id": "backend_investigation",
-                "levers": ["origin/app server profiling", "release-change correlation"],
-                "action": (f"Backend/server processing time rose for {scope} while first-byte (delivery) was "
-                           f"flat — profile the origin/app response for that segment and correlate with "
-                           f"recent back-end releases."),
+                "id": "pre_request_investigation",
+                "levers": ["redirect / DNS / TLS / connection review", "service worker & Critical-CH audit"],
+                "action": (f"Pre-request overhead rose for {scope} while first-byte (delivery) was flat — the "
+                           f"extra time is before the request goes out, so review redirects, DNS/TLS/connection "
+                           f"setup, service-worker startup, and any client-hints (Critical-CH) reconnection for "
+                           f"that segment rather than the origin response or front-end."),
                 "scope_tag": "app_change"})
     return out
 
@@ -3746,7 +3792,10 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # wrong layer by a coarse flag. Skipped for non-paint metrics / older data.
     component = None
     if METRIC_PROFILE["profile_key"] in ("lcp", "fcp"):
-        component = component_attribution(df, TIMER_COL, LABEL_COL, floor_ms=SEVERITY_FLOOR_MS)
+        # v6.9.23: judge layer materiality by EFFECT_FLOOR_MS (the same 'material effect'
+        # bar the mix/within decomposition uses), so a real secondary layer (e.g. a
+        # front-end +139 ms under a delivery-dominant FCP rise) is not dismissed as flat.
+        component = component_attribution(df, TIMER_COL, LABEL_COL, floor_ms=EFFECT_FLOOR_MS)
         if component:
             print(f"component attribution: cause={component['cause']} | "
                   f"waiting={component.get('waiting', {}).get('delta')} "
