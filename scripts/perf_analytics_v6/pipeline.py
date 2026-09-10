@@ -2140,19 +2140,36 @@ def component_attribution(df, timer_col="timer", label_col="label", floor_ms=50.
     t = pd.to_numeric(df[timer_col], errors="coerce")
     bk = pd.to_numeric(df[backend_col], errors="coerce")
     res = {"total": _delta(t), "backend": _delta(bk), "frontend": _delta(t - bk)}
-    cand = {}
-    if res["backend"]["delta"] is not None:
-        cand["backend"] = res["backend"]["delta"]
-    if res["frontend"]["delta"] is not None:
-        cand["frontend"] = res["frontend"]["delta"]
     if waiting_col in df:
         res["waiting"] = _delta(pd.to_numeric(df[waiting_col], errors="coerce"))
-        if res["waiting"]["delta"] is not None:
-            cand["delivery"] = res["waiting"]["delta"]
     if uno_col in df:
         res["uno"] = _delta(pd.to_numeric(df[uno_col], errors="coerce"))
-    material = {k: v for k, v in cand.items() if v >= floor_ms}
-    res["cause"] = max(material, key=material.get) if material else "broad"
+    # INDEPENDENT, ADDITIVE layers of the metric rise (waiting is INSIDE backend,
+    # so comparing waiting vs backend as siblings would double-count it):
+    #   metric = backend + frontend ; backend = waiting(=delivery/first-byte) + server
+    #   => metric_delta = delivery(waiting) + server(backend-waiting) + frontend(metric-backend)
+    bd = res["backend"]["delta"]
+    fd = res["frontend"]["delta"]
+    wd = res.get("waiting", {}).get("delta")
+    layers = {}
+    if wd is not None:
+        layers["delivery"] = round(wd, 1)                       # first-byte / TTFB
+        if bd is not None:
+            layers["server"] = round(bd - wd, 1)               # backend after first byte
+    elif bd is not None:
+        layers["backend"] = round(bd, 1)                        # no waiting split available
+    if fd is not None:
+        layers["frontend"] = round(fd, 1)
+    res["layers"] = layers
+    material = {k: v for k, v in layers.items() if v >= floor_ms}
+    if not material:
+        res["cause"] = "broad"
+    else:
+        tot = sum(material.values())
+        top = max(material, key=material.get)
+        # single cause only when one layer clearly dominates; else a broad,
+        # multi-layer rise (naming one layer would mislead).
+        res["cause"] = top if (tot > 0 and material[top] / tot >= 0.60) else "broad"
     return res
 
 
@@ -2201,32 +2218,43 @@ def build_narrative_facts(findings):
     # backend / frontend = metric-backend). Reads the single `cause` so the story
     # can't send the reader to the wrong layer. No 'p75'/'share' keyword and only
     # findings-sourced numbers, so it binds cleanly.
+    # v6.9.18 (Gap 2 fix): waiting is INSIDE backend, so the layers are the additive
+    # delivery(waiting) / server(backend-waiting) / frontend(metric-backend). Word
+    # each from the ACTUAL before->after values (never hard-code 'flat'); a broad,
+    # multi-layer rise is named as such instead of pinned on one layer.
     _ca = findings.get("component_attribution") or {}
     _cause = _ca.get("cause")
     def _cv(k):
         return _ca.get(k) or {}
+    _wv, _bv, _fe = _cv("waiting"), _cv("backend"), _cv("frontend")
     if _cause == "frontend":
-        _fe = _cv("frontend")
         facts["component_cause"] = (
             f"The rise is in front-end rendering (the metric minus backend): front-end render time went "
             f"from {fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])}, while first-byte (waiting) and "
-            f"backend time stayed flat and page weight did not grow — so this is a front-end issue, not "
-            f"delivery (CDN/origin) or backend.")
+            f"backend time did not materially change and page weight did not grow — so this is a "
+            f"front-end issue, not delivery (CDN/origin) or backend.")
     elif _cause == "delivery":
-        _wv = _cv("waiting")
         facts["component_cause"] = (
             f"The rise is in first-byte time (waiting): it went from {fmt_ms(_wv['normal'])} to "
-            f"{fmt_ms(_wv['anomaly'])} — a delivery-layer (CDN/origin) issue.")
-    elif _cause == "backend":
-        _bv = _cv("backend"); _uno = _cv("uno")
-        _extra = ""
+            f"{fmt_ms(_wv['anomaly'])}, while backend processing and front-end rendering did not "
+            f"materially change — a delivery-layer (CDN/origin) issue.")
+    elif _cause == "server":
+        _uno = _cv("uno"); _extra = ""
         if _uno.get("delta") is not None and _uno["delta"] >= 50:
             _extra = (" Unattributed nav overhead (UNO) also rose, which points at audience/navigation "
                       "factors (lower-end devices, external or missing referrers, more landing entries) "
                       "rather than the site's own front-end code.")
         facts["component_cause"] = (
-            f"The rise is in backend/server time: it went from {fmt_ms(_bv['normal'])} to "
-            f"{fmt_ms(_bv['anomaly'])}, while first-byte (waiting) stayed flat.{_extra}")
+            f"The rise is in backend server processing (after first byte): backend time went from "
+            f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])} while first-byte (waiting) went from "
+            f"{fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])} (little changed).{_extra}")
+    elif _cause == "broad" and _fe.get("normal") is not None and _wv.get("normal") is not None:
+        facts["component_cause"] = (
+            f"The rise spans multiple layers rather than one: first-byte (waiting) went from "
+            f"{fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])}, backend from {fmt_ms(_bv['normal'])} to "
+            f"{fmt_ms(_bv['anomaly'])}, and front-end rendering (metric minus backend) from "
+            f"{fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])} — a broad slowdown, so no single layer "
+            f"is the whole story.")
     h = findings.get("headline", {})
     if h.get("transition_sentence"):
         facts["headline"] = h["transition_sentence"]
@@ -3102,18 +3130,19 @@ def route_actions_by_cause(findings, actions):
         scope = f"the {_lab} {_dw}"
     else:
         scope = "the affected segment"
+    nondelivery = cause in ("frontend", "server", "backend")   # first-byte is NOT the driver
     out = []
     for a in actions:
         st = a.get("scope_tag")
         if st == "edge_cache":
-            if growing and cause not in ("frontend", "backend"):
+            if growing and not nondelivery:
                 names = ", ".join(humanize_region(g["segment"]) for g in growing[:3])
                 out.append(dict(a, action=(
                     f"A growing region ({names}) may be hitting a cold origin: confirm it is served from "
                     f"a nearby edge tier and review the cache key so its first-time visitors benefit from a "
                     f"warm shared cache.")))
             continue  # otherwise drop the offload action (no growing region, or wrong layer)
-        if st == "delivery_ops" and cause in ("frontend", "backend"):
+        if st == "delivery_ops" and nondelivery:
             continue  # delivery investigation is irrelevant for a front-end/backend cause
         out.append(a)
     if cause == "frontend":
@@ -3128,7 +3157,7 @@ def route_actions_by_cause(findings, actions):
                        f"scoped to {scope}, and check for a recent front-end release or third-party tag change "
                        f"targeting it."),
             "scope_tag": "app_change"})
-    elif cause == "backend":
+    elif cause in ("server", "backend"):
         _uno = (ca.get("uno") or {}).get("delta")
         if _uno is not None and _uno >= 50:
             out.append({
