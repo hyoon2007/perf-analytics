@@ -2261,17 +2261,21 @@ def build_narrative_facts(findings):
             _extra = (" Unattributed nav overhead (UNO) also rose, which points at audience/navigation "
                       "factors (lower-end devices, external or missing referrers, more landing entries) "
                       "rather than the site's own front-end code.")
+        # v6.9.21 (#1): label the server-side portion "Backend(TTFB) time" and do
+        # not print the first-byte (waiting) before/after separately — waiting is
+        # part of backend, so showing both confuses the reader.
         facts["component_cause"] = (
-            f"The rise is in backend server processing (after first byte): backend time went from "
-            f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])} while first-byte (waiting) went from "
-            f"{fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])} (little changed).{_extra}")
-    elif _cause == "broad" and _fe.get("normal") is not None and _wv.get("normal") is not None:
+            f"The rise is in backend server processing (after first byte): Backend(TTFB) time went from "
+            f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])}, with first-byte time itself little "
+            f"changed.{_extra}")
+    elif _cause == "broad" and _fe.get("normal") is not None and _bv.get("normal") is not None:
+        # v6.9.21 (#1): Backend(TTFB) already includes first-byte, so show it +
+        # front-end only (no separate waiting line).
         facts["component_cause"] = (
-            f"The rise spans multiple layers rather than one: first-byte (waiting) went from "
-            f"{fmt_ms(_wv['normal'])} to {fmt_ms(_wv['anomaly'])}, backend from {fmt_ms(_bv['normal'])} to "
-            f"{fmt_ms(_bv['anomaly'])}, and front-end rendering (metric minus backend) from "
-            f"{fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])} — a broad slowdown, so no single layer "
-            f"is the whole story.")
+            f"The rise spans multiple layers rather than one: Backend(TTFB) time went from "
+            f"{fmt_ms(_bv['normal'])} to {fmt_ms(_bv['anomaly'])}, and front-end rendering (metric minus "
+            f"backend) from {fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])} — a broad slowdown, so no "
+            f"single layer is the whole story.")
     h = findings.get("headline", {})
     if h.get("transition_sentence"):
         facts["headline"] = h["transition_sentence"]
@@ -3860,6 +3864,13 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         outliers, within_flags=within_flags,
         focus_selection=focus_selection, coverage=coverage, materiality=verdict_materiality,
         delivery_relevant=METRIC_PROFILE.get("delivery_relevant", True))
+    # v6.9.21 (#5): make the Executive Summary reflect the component cause. A broad,
+    # multi-layer rise must not read as "investigate delivery (CDN/origin) first"
+    # when front-end rendering rose just as much — that misleads. Reconcile the
+    # verdict sentence with the single component cause.
+    if verdict_code == "delivery_regression" and (component or {}).get("cause") == "broad":
+        verdict_sentence = ("The regression spans multiple layers — both first-byte/delivery and "
+                            "front-end rendering rose — so investigate both rather than delivery alone.")
 
     def _label_movers(movers, dim):
         out = []
