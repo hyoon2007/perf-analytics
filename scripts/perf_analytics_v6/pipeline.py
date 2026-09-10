@@ -2088,20 +2088,30 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
     return bugs
 
 def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
-                                 min_n=300, floor_ms=50.0, contribution_floor=None):
-    """v6.9.16 (Gap 3): generic scan for a segment VALUE (in any of `dims`, e.g.
-    country / isp / deviceType) whose OWN metric p75 regressed materially — even
-    when its traffic did NOT grow, which the mix / new-segment probes miss. No
-    value is hard-coded; every value with enough support is tested identically.
-    Ranked by contribution to the sitewide rise (anomaly share x delta)."""
+                                 min_n=300, floor_ms=50.0, excess_floor=None,
+                                 max_hotspots=3):
+    """v6.9.16 (Gap 3) / v6.9.22 (excess-hotspot): find segment VALUES (in any of
+    `dims` — country/isp/device) that slowed MORE than the site overall — a genuine
+    hotspot — rather than a large-share 'passenger' that only looks slow because it
+    carries a slow sub-population (e.g. Mobile at 73% share appears slow only
+    because Korea's traffic flows through it). A value is a hotspot when its own
+    p75 rise EXCEEDS the sitewide p75 rise by >= excess_floor; hotspots are ranked
+    by IMPACT = anomaly_share x excess (above-average burden weighted by reach) and
+    de-duplicated by MARGINAL INDEPENDENCE — a hotspot that disappears once an
+    already-named hotspot is removed (e.g. a Korean ISP inside the Korea market) is
+    dropped. Falls back to a flat delta floor + contribution rank when excess_floor
+    is None (older callers)."""
     is_n = df[label_col] == 0
     tot_n = int(is_n.sum()); tot_a = int((~is_n).sum())
     if tot_n == 0 or tot_a == 0:
         return []
-    def _p75(s):
-        s = pd.to_numeric(s, errors="coerce").dropna()
+    def _p75(mask):
+        s = pd.to_numeric(df.loc[mask, timer_col], errors="coerce").dropna()
         return float(np.nanpercentile(s, 75)) if len(s) else float("nan")
-    out = []
+    site_n, site_a = _p75(is_n), _p75(~is_n)
+    site_delta = (site_a - site_n) if (site_n == site_n and site_a == site_a) else 0.0
+
+    cands = []
     for dim in dims:
         if dim not in df:
             continue
@@ -2111,27 +2121,50 @@ def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
             nn = int(m_n.sum()); na = int(m_a.sum())
             if nn < min_n or na < min_n:
                 continue
-            pn = _p75(df.loc[m_n, timer_col]); pa = _p75(df.loc[m_a, timer_col])
+            pn = _p75(m_n); pa = _p75(m_a)
             if not (pn == pn and pa == pa):
                 continue
             sn = nn / tot_n * 100.0; sa = na / tot_a * 100.0
-            # v6.9.20 (Gate A): materiality by CONTRIBUTION (share x delta) so a
-            # small segment must move more to qualify; falls back to a flat delta
-            # floor when no contribution_floor is given.
-            if contribution_floor is not None:
-                if (sa / 100.0) * (pa - pn) < contribution_floor:
-                    continue
-            elif (pa - pn) < floor_ms:
+            excess = (pa - pn) - site_delta
+            if excess_floor is not None:
+                if excess < excess_floor:
+                    continue                              # not worse than the site -> passenger
+            elif (pa - pn) < floor_ms:                    # legacy fallback
                 continue
-            out.append({"dim": dim, "segment": str(val),
-                        "p75_normal": round(pn, 1), "p75_anomaly": round(pa, 1),
-                        "delta_ms": round(pa - pn, 1),
-                        "share_normal_pct": round(sn, 2), "share_anomaly_pct": round(sa, 2),
-                        "share_delta_pp": round(sa - sn, 2),
-                        "traffic_grew": bool(sa - sn > 1.0),
-                        "contribution": round(sa / 100.0 * (pa - pn), 1)})
-    out.sort(key=lambda r: -r["contribution"])
-    return out[:8]
+            cands.append({"dim": dim, "segment": str(val),
+                          "p75_normal": round(pn, 1), "p75_anomaly": round(pa, 1),
+                          "delta_ms": round(pa - pn, 1),
+                          "share_normal_pct": round(sn, 2), "share_anomaly_pct": round(sa, 2),
+                          "share_delta_pp": round(sa - sn, 2),
+                          "traffic_grew": bool(sa - sn > 1.0),
+                          "excess_ms": round(excess, 1),
+                          "impact": round(sa / 100.0 * max(excess, 0.0), 1),
+                          "contribution": round(sa / 100.0 * (pa - pn), 1)})
+    if excess_floor is None:
+        cands.sort(key=lambda r: -r["contribution"])
+        return cands[:8]
+
+    # rank by impact, then keep only hotspots that survive after removing the rows
+    # already claimed by a higher-impact hotspot (marginal independence dedup).
+    cands.sort(key=lambda r: -r["impact"])
+    selected = []
+    claimed = pd.Series(False, index=df.index)
+    for r in cands:
+        if len(selected) >= max_hotspots:
+            break
+        cm = df[r["dim"]].astype(str) == r["segment"]
+        keep = ~claimed
+        sub_n = is_n & keep & cm; sub_a = (~is_n) & keep & cm
+        if int(sub_a.sum()) < min_n or int(sub_n.sum()) < min_n:
+            continue                                      # mostly inside an already-named hotspot
+        pn2, pa2 = _p75(sub_n), _p75(sub_a)
+        kn, ka = (is_n & keep), ((~is_n) & keep)
+        sd2 = (_p75(ka) - _p75(kn))
+        if not (pn2 == pn2 and pa2 == pa2) or ((pa2 - pn2) - sd2) < excess_floor:
+            continue                                      # explained by a named hotspot -> drop
+        selected.append(r)
+        claimed = claimed | cm
+    return selected
 
 
 def component_attribution(df, timer_col="timer", label_col="label", floor_ms=50.0,
@@ -3702,7 +3735,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # probes above miss. No value is hard-coded; every dim value is tested alike.
     segment_self_regressions = segment_self_regression_scan(
         df, ["country", "isp", "deviceType"], TIMER_COL, LABEL_COL,
-        min_n=MIN_SEG_N, floor_ms=SEVERITY_FLOOR_MS, contribution_floor=EFFECT_FLOOR_MS)
+        min_n=MIN_SEG_N, floor_ms=SEVERITY_FLOOR_MS, excess_floor=EFFECT_FLOOR_MS)
     if segment_self_regressions:
         print("segment self-regressions:", [(s["dim"], s["segment"],
               f"{s['p75_normal']}->{s['p75_anomaly']}ms share {s['share_delta_pp']:+}pp") for s in segment_self_regressions[:5]])
