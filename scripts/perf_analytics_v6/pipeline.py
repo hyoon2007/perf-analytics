@@ -47,7 +47,7 @@ ARTIFACT_MS       = 60_000
 SEVERITY_FLOOR_MS = 50
 SAMPLE_DRIFT_TOL  = 3.0
 MIN_SEG_N         = 300
-MIN_SHARE_PP      = 1.0
+MIN_SHARE_PP      = 3.0          # v6.9.19: raised (was 1.0) — min share_delta_pp to count as "gained share"
 MAX_FOCUS         = 3
 FEATURE_LABEL_OVERRIDES = {}
 
@@ -884,8 +884,8 @@ METRIC_PROFILES = {
         "abbrev": "LCP", "unit": "ms", "unit_kind": "duration",
         "good_ms": 2500, "poor_ms": 4000,
         "artifact_ms": 60_000,          # background-tab beacons
-        "severity_floor_ms": 100,       # min p75 delta worth alerting
-        "effect_floor_ms": 50,          # min mix/within effect to be "material"
+        "severity_floor_ms": 400,       # v6.9.19: raised (was 100) — min sitewide p75 delta worth reporting
+        "effect_floor_ms": 200,         # v6.9.19: min mix/within effect to be "material" (~0.5x severity)
         "higher_is_worse": True,
         "hero_element": True,           # LCP has a hero element -> preload advice fits
         "delivery_relevant": True,      # TTFB/origin latency is part of LCP
@@ -896,8 +896,8 @@ METRIC_PROFILES = {
         "abbrev": "FCP", "unit": "ms", "unit_kind": "duration",
         "good_ms": 1800, "poor_ms": 3000,
         "artifact_ms": 60_000,
-        "severity_floor_ms": 80,
-        "effect_floor_ms": 40,
+        "severity_floor_ms": 200,       # v6.9.19: raised (was 80)
+        "effect_floor_ms": 100,         # v6.9.19: was 40 (~0.5x severity)
         "higher_is_worse": True,
         "hero_element": False,
         "delivery_relevant": True,      # TTFB/origin latency is part of FCP
@@ -908,8 +908,8 @@ METRIC_PROFILES = {
         "abbrev": "TBT", "unit": "ms", "unit_kind": "duration",
         "good_ms": 200, "poor_ms": 600,
         "artifact_ms": 30_000,          # blocking time can't plausibly be minutes
-        "severity_floor_ms": 40,        # smaller scale than LCP
-        "effect_floor_ms": 25,
+        "severity_floor_ms": 100,       # v6.9.19: raised (was 40)
+        "effect_floor_ms": 50,          # v6.9.19: was 25 (~0.5x severity)
         "higher_is_worse": True,
         "hero_element": False,          # JS-bound: preload/hero advice does NOT fit
         "delivery_relevant": False,     # main-thread/JS metric: CDN/origin latency is NOT a driver
@@ -920,8 +920,8 @@ METRIC_PROFILES = {
         "abbrev": "TTFB", "unit": "ms", "unit_kind": "duration",
         "good_ms": 800, "poor_ms": 1800,
         "artifact_ms": 60_000,
-        "severity_floor_ms": 50,
-        "effect_floor_ms": 30,
+        "severity_floor_ms": 100,       # v6.9.19: raised (was 50)
+        "effect_floor_ms": 50,          # v6.9.19: was 30
         "higher_is_worse": True,
         "hero_element": False,          # server/network-bound: origin/CDN advice fits
         "delivery_first": True,         # TTFB regressions point at delivery, not content
