@@ -2078,6 +2078,45 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
             bugs.append(f"{key} has numbers outside the whitelist: {unknown}")
     return bugs
 
+def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
+                                 min_n=300, floor_ms=50.0):
+    """v6.9.16 (Gap 3): generic scan for a segment VALUE (in any of `dims`, e.g.
+    country / isp / deviceType) whose OWN metric p75 regressed materially — even
+    when its traffic did NOT grow, which the mix / new-segment probes miss. No
+    value is hard-coded; every value with enough support is tested identically.
+    Ranked by contribution to the sitewide rise (anomaly share x delta)."""
+    is_n = df[label_col] == 0
+    tot_n = int(is_n.sum()); tot_a = int((~is_n).sum())
+    if tot_n == 0 or tot_a == 0:
+        return []
+    def _p75(s):
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return float(np.nanpercentile(s, 75)) if len(s) else float("nan")
+    out = []
+    for dim in dims:
+        if dim not in df:
+            continue
+        key = df[dim].astype(str)
+        for val in key[~is_n].value_counts().index:      # values seen in the anomaly window
+            m_n = is_n & (key == val); m_a = (~is_n) & (key == val)
+            nn = int(m_n.sum()); na = int(m_a.sum())
+            if nn < min_n or na < min_n:
+                continue
+            pn = _p75(df.loc[m_n, timer_col]); pa = _p75(df.loc[m_a, timer_col])
+            if not (pn == pn and pa == pa) or (pa - pn) < floor_ms:
+                continue
+            sn = nn / tot_n * 100.0; sa = na / tot_a * 100.0
+            out.append({"dim": dim, "segment": str(val),
+                        "p75_normal": round(pn, 1), "p75_anomaly": round(pa, 1),
+                        "delta_ms": round(pa - pn, 1),
+                        "share_normal_pct": round(sn, 2), "share_anomaly_pct": round(sa, 2),
+                        "share_delta_pp": round(sa - sn, 2),
+                        "traffic_grew": bool(sa - sn > 1.0),
+                        "contribution": round(sa / 100.0 * (pa - pn), 1)})
+    out.sort(key=lambda r: -r["contribution"])
+    return out[:8]
+
+
 def _reqcount_fell(rp, floor_pct=-15.0):
     """v6.9.14 (P4): True + (normal, anomaly) medians when a focus page's request
     count dropped materially. 'not heavier' includes 'materially lighter', so a
@@ -2095,6 +2134,29 @@ def build_narrative_facts(findings):
     told to reuse them. This removes the need for the model to pick the right
     field out of a large JSON — the root cause of number misassignment."""
     facts = {}
+    # v6.9.16 (Gap 3): if a segment (region/ISP/device) regressed on its own —
+    # especially with flat/falling traffic — lead with it as the concentration.
+    # Generic: the value comes from the data, never hard-coded. Before->after
+    # only (no raw delta) so p75/share numbers bind cleanly to their own metrics.
+    _ssr = (findings.get("segment_self_regressions") or [])
+    if _ssr:
+        _t = _ssr[0]
+        _dw = {"country": "region", "isp": "network (ISP)",
+               "deviceType": "device type"}.get(_t["dim"], _t["dim"])
+        _lab = humanize_region(_t["segment"]) if _t["dim"] == "country" else _t["segment"]
+        if _t.get("traffic_grew"):
+            facts["segment_concentration"] = (
+                f"The regression is concentrated in the {_lab} {_dw}: its p75 rose from "
+                f"{fmt_ms(_t['p75_normal'])} to {fmt_ms(_t['p75_anomaly'])} and its traffic share also "
+                f"grew from {fmt_pct(_t['share_normal_pct'])} to {fmt_pct(_t['share_anomaly_pct'])}, so "
+                f"part of the sitewide rise is this segment growing and part is it slowing on its own.")
+        else:
+            _tr = "fell" if _t["share_delta_pp"] < 0 else "held"
+            facts["segment_concentration"] = (
+                f"The regression is concentrated in the {_lab} {_dw}: its p75 rose from "
+                f"{fmt_ms(_t['p75_normal'])} to {fmt_ms(_t['p75_anomaly'])} while its traffic share {_tr} "
+                f"from {fmt_pct(_t['share_normal_pct'])} to {fmt_pct(_t['share_anomaly_pct'])} — a genuine "
+                f"self-slowdown in this segment, not a traffic-mix effect.")
     h = findings.get("headline", {})
     if h.get("transition_sentence"):
         facts["headline"] = h["transition_sentence"]
@@ -2568,6 +2630,10 @@ def build_section_facts(findings):
         sec["Executive Summary"].append(flat["severity_context"])
     if "impact" in flat:
         sec["Executive Summary"].append(flat["impact"])
+    # v6.9.16 (Gap 3): a segment (region/ISP/device) that regressed on its own —
+    # even with flat/falling traffic — leads What Changed as the concentration.
+    if "segment_concentration" in flat:
+        sec["What Changed"].append(flat["segment_concentration"])
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
@@ -3412,6 +3478,16 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         print("new/surging segments:", [(s["dim"], s["segment"],
               f"{s['normal_share_pct']}->{s['anomaly_share_pct']}%") for s in new_segments])
 
+    # v6.9.16 (Gap 3): generic scan for a segment (region/ISP/device) that slowed
+    # on its OWN — even with flat/falling traffic — which the traffic-growth
+    # probes above miss. No value is hard-coded; every dim value is tested alike.
+    segment_self_regressions = segment_self_regression_scan(
+        df, ["country", "isp", "deviceType"], TIMER_COL, LABEL_COL,
+        min_n=MIN_SEG_N, floor_ms=SEVERITY_FLOOR_MS)
+    if segment_self_regressions:
+        print("segment self-regressions:", [(s["dim"], s["segment"],
+              f"{s['p75_normal']}->{s['p75_anomaly']}ms share {s['share_delta_pp']:+}pp") for s in segment_self_regressions[:5]])
+
     # v6.9.4: for EACH focus page type, split its own p75 rise into an internal
     # mix shift vs a genuine same-audience slowdown, so the role label reflects
     # what really happened (a section whose rise is mostly an internal India /
@@ -3643,6 +3719,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
             "note": "indicator of audience change, not a performance cause"}
             for d_ in associated_symptoms[:6]] if drivers else []),
     }
+    findings["segment_self_regressions"] = segment_self_regressions   # v6.9.16 (Gap 3)
     # v5: attach Akamai-playbook remediation and findings-consistent hypotheses
     findings["remediation_playbook"] = match_playbook(findings, metric_key=METRIC_PROFILE["profile_key"])
     # v6.9.6: the metric did not degrade -> drop degradation actions (e.g. "investigate
