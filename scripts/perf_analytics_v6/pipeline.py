@@ -309,9 +309,21 @@ def behavior_signals(df, label_col="label",
 # -------------------------------------------------------- delivery health
 def delivery_health(df, label_col="label", tol_pct=15,
                     metrics=("edgetime", "origintime", "cdncacherate"),
-                    origin_flag_col="origin_flag"):
+                    origin_flag_col="origin_flag",
+                    waiting_col="waiting", wait_floor_ms=50.0):
     """CDN/origin health check: verdict is 'clean' unless a delivery metric
-    degrades beyond tolerance in the anomaly window."""
+    degrades beyond tolerance in the anomaly window.
+
+    v6.9.15 (Gap 1): a paint metric (FCP/LCP) can only be delivery-driven if the
+    actual user-experienced first-byte time (`waiting`/TTFB) rose. `origintime`
+    is a median over the origin-hit MINORITY (often ~10% of traffic) and can rise
+    while overall first-byte time does not — which previously fired a spurious
+    'delivery_regression' on a purely front-end regression. So when `waiting` is
+    available and did NOT rise by at least `wait_floor_ms`, delivery is not the
+    driver and the verdict is overridden to 'clean'. When the analyzed metric IS
+    waiting (waiting == timer), a real waiting alert has waiting rising and is
+    never suppressed; when `waiting` is absent (older data) behaviour is
+    unchanged."""
     res = {"metrics": {}, "issues": []}
     for m in metrics:
         if m not in df:
@@ -335,6 +347,20 @@ def delivery_health(df, label_col="label", tol_pct=15,
         if o1 > o0 + 5:
             res["issues"].append("origin_traffic_share")
     res["verdict"] = "degraded" if res["issues"] else "clean"
+    # v6.9.15 (Gap 1): waiting-based attribution gate (see docstring).
+    if waiting_col in df:
+        def _p75(s):
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            return float(np.nanpercentile(s, 75)) if len(s) else float("nan")
+        wn = _p75(df.loc[df[label_col] == 0, waiting_col])
+        wa = _p75(df.loc[df[label_col] == 1, waiting_col])
+        wd = round(wa - wn, 1) if (wn == wn and wa == wa) else None
+        res["waiting_p75"] = {"normal": None if wn != wn else round(wn, 1),
+                              "anomaly": None if wa != wa else round(wa, 1),
+                              "delta": wd}
+        if res["verdict"] == "degraded" and wd is not None and wd < wait_floor_ms:
+            res["verdict"] = "clean"
+            res["suppressed_by_waiting"] = True
     return res
 
 
