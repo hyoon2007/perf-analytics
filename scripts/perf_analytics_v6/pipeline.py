@@ -2117,6 +2117,45 @@ def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
     return out[:8]
 
 
+def component_attribution(df, timer_col="timer", label_col="label", floor_ms=50.0,
+                          backend_col="backend", waiting_col="waiting", uno_col="uno"):
+    """v6.9.17 (Gap 2): attribute a paint metric's (FCP/LCP) p75 rise to the LAYER
+    it lives in — delivery (waiting/TTFB), backend (server/app), or frontend
+    (render = metric - backend, per the metric definition). Returns the dominant
+    `cause` — the single source of truth that the narrative and the action routing
+    both read, so a coarse flag can no longer send an action to the wrong layer —
+    plus the per-component p75 values/deltas. Only meaningful for paint metrics;
+    returns None when the backend column is absent (older data / non-paint)."""
+    if backend_col not in df:
+        return None
+    is_n = df[label_col] == 0
+    def _p75(s):
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return float(np.nanpercentile(s, 75)) if len(s) else float("nan")
+    def _delta(series):
+        n = _p75(series[is_n]); a = _p75(series[~is_n])
+        if not (n == n and a == a):
+            return {"normal": None, "anomaly": None, "delta": None}
+        return {"normal": round(n, 1), "anomaly": round(a, 1), "delta": round(a - n, 1)}
+    t = pd.to_numeric(df[timer_col], errors="coerce")
+    bk = pd.to_numeric(df[backend_col], errors="coerce")
+    res = {"total": _delta(t), "backend": _delta(bk), "frontend": _delta(t - bk)}
+    cand = {}
+    if res["backend"]["delta"] is not None:
+        cand["backend"] = res["backend"]["delta"]
+    if res["frontend"]["delta"] is not None:
+        cand["frontend"] = res["frontend"]["delta"]
+    if waiting_col in df:
+        res["waiting"] = _delta(pd.to_numeric(df[waiting_col], errors="coerce"))
+        if res["waiting"]["delta"] is not None:
+            cand["delivery"] = res["waiting"]["delta"]
+    if uno_col in df:
+        res["uno"] = _delta(pd.to_numeric(df[uno_col], errors="coerce"))
+    material = {k: v for k, v in cand.items() if v >= floor_ms}
+    res["cause"] = max(material, key=material.get) if material else "broad"
+    return res
+
+
 def _reqcount_fell(rp, floor_pct=-15.0):
     """v6.9.14 (P4): True + (normal, anomaly) medians when a focus page's request
     count dropped materially. 'not heavier' includes 'materially lighter', so a
@@ -2157,6 +2196,37 @@ def build_narrative_facts(findings):
                 f"{fmt_ms(_t['p75_normal'])} to {fmt_ms(_t['p75_anomaly'])} while its traffic share {_tr} "
                 f"from {fmt_pct(_t['share_normal_pct'])} to {fmt_pct(_t['share_anomaly_pct'])} — a genuine "
                 f"self-slowdown in this segment, not a traffic-mix effect.")
+
+    # v6.9.17 (Gap 2): which LAYER the paint-metric rise lives in (delivery /
+    # backend / frontend = metric-backend). Reads the single `cause` so the story
+    # can't send the reader to the wrong layer. No 'p75'/'share' keyword and only
+    # findings-sourced numbers, so it binds cleanly.
+    _ca = findings.get("component_attribution") or {}
+    _cause = _ca.get("cause")
+    def _cv(k):
+        return _ca.get(k) or {}
+    if _cause == "frontend":
+        _fe = _cv("frontend")
+        facts["component_cause"] = (
+            f"The rise is in front-end rendering (the metric minus backend): front-end render time went "
+            f"from {fmt_ms(_fe['normal'])} to {fmt_ms(_fe['anomaly'])}, while first-byte (waiting) and "
+            f"backend time stayed flat and page weight did not grow — so this is a front-end issue, not "
+            f"delivery (CDN/origin) or backend.")
+    elif _cause == "delivery":
+        _wv = _cv("waiting")
+        facts["component_cause"] = (
+            f"The rise is in first-byte time (waiting): it went from {fmt_ms(_wv['normal'])} to "
+            f"{fmt_ms(_wv['anomaly'])} — a delivery-layer (CDN/origin) issue.")
+    elif _cause == "backend":
+        _bv = _cv("backend"); _uno = _cv("uno")
+        _extra = ""
+        if _uno.get("delta") is not None and _uno["delta"] >= 50:
+            _extra = (" Unattributed nav overhead (UNO) also rose, which points at audience/navigation "
+                      "factors (lower-end devices, external or missing referrers, more landing entries) "
+                      "rather than the site's own front-end code.")
+        facts["component_cause"] = (
+            f"The rise is in backend/server time: it went from {fmt_ms(_bv['normal'])} to "
+            f"{fmt_ms(_bv['anomaly'])}, while first-byte (waiting) stayed flat.{_extra}")
     h = findings.get("headline", {})
     if h.get("transition_sentence"):
         facts["headline"] = h["transition_sentence"]
@@ -2634,6 +2704,9 @@ def build_section_facts(findings):
     # even with flat/falling traffic — leads What Changed as the concentration.
     if "segment_concentration" in flat:
         sec["What Changed"].append(flat["segment_concentration"])
+    # v6.9.17 (Gap 2): which layer the rise lives in (delivery/backend/frontend).
+    if "component_cause" in flat:
+        sec["What Changed"].append(flat["component_cause"])
     for key, sentence in flat.items():
         if key.startswith("section::"):
             sec["What Changed"].append(sentence)
@@ -3000,6 +3073,81 @@ def match_playbook(findings, playbook=AKAMAI_PLAYBOOK, metric_key=None):
                              "action": entry["action"],
                              "scope_tag": entry["scope_tag"]})
     return selected
+
+
+def route_actions_by_cause(findings, actions):
+    """v6.9.17 (Gap 2): route remediation by the identified component cause so an
+    action can never be sent to the wrong layer by a coarse flag.
+
+    * cause=frontend/backend -> drop delivery (delivery_ops) actions, add the
+      layer-appropriate investigation.
+    * edge/offload (edge_cache) actions fire ONLY for a delivery/broad cause AND
+      when a real GROWING region exists (from new_segment_probe, not a 1pp nudge),
+      and are rewritten to NAME the actual region(s); otherwise dropped. This kills
+      the old 'confirm the growing region' misfire when no region grew.
+    The offload (edge_cache) gating applies even when component data is absent
+    (cause is None) — growing_regions comes from new_segment_probe, which needs no
+    component columns — so the 'growing region' misfire is fixed on older data too;
+    the frontend/backend routing only adds/removes layer actions when a cause is
+    identified."""
+    ca = findings.get("component_attribution") or {}
+    cause = ca.get("cause")
+    growing = findings.get("growing_regions") or []
+    ssr = findings.get("segment_self_regressions") or []
+    if ssr:
+        _t = ssr[0]
+        _dw = {"country": "region", "isp": "network (ISP)",
+               "deviceType": "device type"}.get(_t["dim"], _t["dim"])
+        _lab = humanize_region(_t["segment"]) if _t["dim"] == "country" else _t["segment"]
+        scope = f"the {_lab} {_dw}"
+    else:
+        scope = "the affected segment"
+    out = []
+    for a in actions:
+        st = a.get("scope_tag")
+        if st == "edge_cache":
+            if growing and cause not in ("frontend", "backend"):
+                names = ", ".join(humanize_region(g["segment"]) for g in growing[:3])
+                out.append(dict(a, action=(
+                    f"A growing region ({names}) may be hitting a cold origin: confirm it is served from "
+                    f"a nearby edge tier and review the cache key so its first-time visitors benefit from a "
+                    f"warm shared cache.")))
+            continue  # otherwise drop the offload action (no growing region, or wrong layer)
+        if st == "delivery_ops" and cause in ("frontend", "backend"):
+            continue  # delivery investigation is irrelevant for a front-end/backend cause
+        out.append(a)
+    if cause == "frontend":
+        out.append({
+            "id": "frontend_investigation",
+            "levers": ["Script Management (defer/async, third-party tag audit)",
+                       "EdgeWorkers (offload main-thread work)",
+                       "front-end release / deploy correlation"],
+            "action": (f"Front-end rendering slowed for {scope}; first-byte (delivery) and backend time are "
+                       f"flat and page weight did not grow, so this is not a CDN/origin or backend issue. "
+                       f"Compare the resource waterfall and render-blocking resources between the two windows "
+                       f"scoped to {scope}, and check for a recent front-end release or third-party tag change "
+                       f"targeting it."),
+            "scope_tag": "app_change"})
+    elif cause == "backend":
+        _uno = (ca.get("uno") or {}).get("delta")
+        if _uno is not None and _uno >= 50:
+            out.append({
+                "id": "backend_audience_audit",
+                "levers": ["referrer / landing-source review", "device-tier segmentation"],
+                "action": (f"Backend/server time rose for {scope} with elevated unattributed nav overhead "
+                           f"(UNO) while first-byte was flat — check for an influx of lower-end devices, "
+                           f"external or missing referrers, or more landing entries; this points at "
+                           f"audience/navigation factors rather than the site's own front-end code."),
+                "scope_tag": "app_change"})
+        else:
+            out.append({
+                "id": "backend_investigation",
+                "levers": ["origin/app server profiling", "release-change correlation"],
+                "action": (f"Backend/server processing time rose for {scope} while first-byte (delivery) was "
+                           f"flat — profile the origin/app response for that segment and correlate with "
+                           f"recent back-end releases."),
+                "scope_tag": "app_change"})
+    return out
 
 
 def local_regression_actions(findings):
@@ -3488,6 +3636,18 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
         print("segment self-regressions:", [(s["dim"], s["segment"],
               f"{s['p75_normal']}->{s['p75_anomaly']}ms share {s['share_delta_pp']:+}pp") for s in segment_self_regressions[:5]])
 
+    # v6.9.17 (Gap 2): for paint metrics, attribute the rise to delivery / backend /
+    # frontend (=metric-backend). The `cause` is the single source of truth the
+    # narrative and action routing read, so an action can no longer be sent to the
+    # wrong layer by a coarse flag. Skipped for non-paint metrics / older data.
+    component = None
+    if METRIC_PROFILE["profile_key"] in ("lcp", "fcp"):
+        component = component_attribution(df, TIMER_COL, LABEL_COL, floor_ms=SEVERITY_FLOOR_MS)
+        if component:
+            print(f"component attribution: cause={component['cause']} | "
+                  f"waiting={component.get('waiting', {}).get('delta')} "
+                  f"backend={component['backend']['delta']} frontend={component['frontend']['delta']}")
+
     # v6.9.4: for EACH focus page type, split its own p75 rise into an internal
     # mix shift vs a genuine same-audience slowdown, so the role label reflects
     # what really happened (a section whose rise is mostly an internal India /
@@ -3720,12 +3880,20 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
             for d_ in associated_symptoms[:6]] if drivers else []),
     }
     findings["segment_self_regressions"] = segment_self_regressions   # v6.9.16 (Gap 3)
+    findings["component_attribution"] = component                     # v6.9.17 (Gap 2)
+    # v6.9.17 (Gap 2): materially GROWING regions (reuse new_segment_probe's vetted
+    # growth detection — notable_shift / surge — not a 1pp nudge) gate the offload
+    # action and name it. Empty here means no region grew -> no offload misfire.
+    findings["growing_regions"] = [s for s in new_segments if s.get("dim") == "country"]
     # v5: attach Akamai-playbook remediation and findings-consistent hypotheses
     findings["remediation_playbook"] = match_playbook(findings, metric_key=METRIC_PROFILE["profile_key"])
     # v6.9.6: the metric did not degrade -> drop degradation actions (e.g. "investigate
     # delivery regression"); recommend only a genuine local regression if one exists.
     if verdict_code in ("improved", "no_action"):
         findings["remediation_playbook"] = local_regression_actions(findings)
+    # v6.9.17 (Gap 2): route actions by the identified component cause (no-op when
+    # cause is None). Fixes the offload misfire and adds the right layer's action.
+    findings["remediation_playbook"] = route_actions_by_cause(findings, findings["remediation_playbook"])
     findings["hypotheses"] = derive_hypotheses(findings)
 
     # v6.1: Python pre-writes every load-bearing sentence so the model never has to
