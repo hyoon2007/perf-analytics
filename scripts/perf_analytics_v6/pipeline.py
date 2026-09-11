@@ -325,13 +325,24 @@ def delivery_health(df, label_col="label", tol_pct=15,
     never suppressed; when `waiting` is absent (older data) behaviour is
     unchanged."""
     res = {"metrics": {}, "issues": []}
+    # v6.9.24: response-TIME metrics use p75 — the report's standard statistic. A
+    # median is dominated by edge cache-hits (~0-1 ms: ~36% of beacons on the 9-9
+    # FCP sample), so it read edge time as "1 ms -> 59 ms" and hid the real move
+    # (p75 82 -> 241 ms). cdncacherate is a RATE, not a duration, so it keeps its
+    # median. Keys are the neutral 'normal'/'anomaly' (no longer '..._median').
+    def _agg(series, metric):
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if not len(s):
+            return float("nan")
+        return float(np.nanpercentile(s, 75)) if metric in ("edgetime", "origintime") \
+            else float(s.median())
     for m in metrics:
         if m not in df:
             continue
-        m0 = float(df.loc[df[label_col] == 0, m].median())
-        m1 = float(df.loc[df[label_col] == 1, m].median())
-        res["metrics"][m] = {"normal_median": round(m0, 1),
-                             "anomaly_median": round(m1, 1),
+        m0 = _agg(df.loc[df[label_col] == 0, m], m)
+        m1 = _agg(df.loc[df[label_col] == 1, m], m)
+        res["metrics"][m] = {"normal": round(m0, 1),
+                             "anomaly": round(m1, 1),
                              "delta": round(m1 - m0, 1)}
         worse = (m1 > m0 * (1 + tol_pct / 100)) if m != "cdncacherate" \
             else (m1 < m0 * (1 - tol_pct / 100))
@@ -342,7 +353,7 @@ def delivery_health(df, label_col="label", tol_pct=15,
         o0 = float((df.loc[df[label_col] == 0, origin_flag_col] == "Y").mean()) * 100
         o1 = float((df.loc[df[label_col] == 1, origin_flag_col] == "Y").mean()) * 100
         res["metrics"]["origin_traffic_share_pct"] = {
-            "normal_median": round(o0, 1), "anomaly_median": round(o1, 1),
+            "normal": round(o0, 1), "anomaly": round(o1, 1),
             "delta": round(o1 - o0, 1)}
         if o1 > o0 + 5:
             res["issues"].append("origin_traffic_share")
@@ -2989,8 +3000,9 @@ def delivery_evidence_line(findings):
     even when it did not itself cross the flag threshold). Returns "" when the
     verdict is not a delivery regression or no delivery numbers are available.
 
-    All medians and deltas come straight from findings.delivery.metrics, so they
-    are already in the number whitelist (collect_numbers walks findings). The
+    All values (p75 for response times, v6.9.24) and deltas come straight from
+    findings.delivery.metrics, so they are already in the number whitelist
+    (collect_numbers walks findings). The
     response-time and offload halves are emitted as SEPARATE sentences on
     purpose: the number-binding validator triggers on the words 'share'/'traffic'
     /'cache', so a millisecond value must never share a sentence with them. The
@@ -3005,7 +3017,7 @@ def delivery_evidence_line(findings):
     for m in ("origintime", "edgetime"):
         v = metrics.get(m)
         if v and m in issues:
-            n, a = v["normal_median"], v["anomaly_median"]
+            n, a = v["normal"], v["anomaly"]
             d = v.get("delta", round(a - n, 1))
             time_clauses.append(f"{_DELIV_EVIDENCE_LABELS[m]} {fmt_ms(n)} → {fmt_ms(a)} ({d:+g} ms)")
     # Offload only. cdncacherate is deliberately excluded: it is beacon-derived
@@ -3015,7 +3027,7 @@ def delivery_evidence_line(findings):
     v = metrics.get("origin_traffic_share_pct")
     offload_sentence = ""
     if v:
-        n, a = v["normal_median"], v["anomaly_median"]
+        n, a = v["normal"], v["anomaly"]
         d = v.get("delta", round(a - n, 1))
         # v6.9.14 (P6): a FALLING origin share in a delivery regression reads like
         # good news (offload improved) next to a bad verdict — clarify that the
@@ -3900,7 +3912,7 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     delivery = delivery_health(df, LABEL_COL)
     print("delivery verdict:", delivery["verdict"], delivery["issues"] or "")
     for m, v in delivery["metrics"].items():
-        print(f"   {m}: {v['normal_median']} -> {v['anomaly_median']}")
+        print(f"   {m}: {v['normal']} -> {v['anomaly']}")
 
 
     # Cell 10 — Step F: models as evidence (skipped when nothing to explain)
