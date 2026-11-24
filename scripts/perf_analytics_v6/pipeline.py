@@ -2098,6 +2098,40 @@ def self_check_supplied_text(findings_or_facts, bindings, allowed_numbers):
             bugs.append(f"{key} has numbers outside the whitelist: {unknown}")
     return bugs
 
+
+def drop_failed_supplied_text(findings, bugs):
+    """v6.9.25: remove exactly the supplied sentences our own gates rejected, from
+    every place collect_supplied_text() draws them (narrative_facts, section_facts,
+    hypotheses, remediation_playbook). A wording bug then degrades the report
+    gracefully instead of aborting delivery of a real anomaly. Mutates `findings`;
+    returns the dropped supplied keys.
+
+    Keys are matched against the bug strings, each of which self_check emits as
+    f"{key} ...", so a key is a safe, unambiguous prefix (every key is unique and
+    bracket-terminated, so one key is never a space-delimited prefix of another)."""
+    supplied = collect_supplied_text(findings)
+    bad_keys = [k for k in supplied if any(b == k or b.startswith(k + " ") for b in bugs)]
+    if not bad_keys:
+        return []
+    bad_values = {supplied[k] for k in bad_keys if isinstance(supplied[k], str)}
+
+    nf = findings.get("narrative_facts")
+    if isinstance(nf, dict):
+        findings["narrative_facts"] = {k: v for k, v in nf.items() if v not in bad_values}
+    sf = findings.get("section_facts")
+    if isinstance(sf, dict):
+        findings["section_facts"] = {sec: [s for s in sents if s not in bad_values]
+                                     for sec, sents in sf.items()}
+    hy = findings.get("hypotheses")
+    if isinstance(hy, list):
+        findings["hypotheses"] = [h for h in hy if h not in bad_values]
+    pb = findings.get("remediation_playbook")
+    if isinstance(pb, list):
+        findings["remediation_playbook"] = [
+            e for e in pb
+            if (e.get("action", "") + " " + " ".join(e.get("levers", []))) not in bad_values]
+    return bad_keys
+
 def segment_self_regression_scan(df, dims, timer_col="timer", label_col="label",
                                  min_n=300, floor_ms=50.0, excess_floor=None,
                                  max_hotspots=3):
@@ -2277,11 +2311,23 @@ def build_narrative_facts(findings):
                 f"grew from {fmt_pct(_t['share_normal_pct'])} to {fmt_pct(_t['share_anomaly_pct'])}, so "
                 f"part of the sitewide rise is this segment growing and part is it slowing on its own.")
         else:
-            _tr = "fell" if _t["share_delta_pp"] < 0 else "held"
+            # v6.9.25: when the share did not move at the reported precision both
+            # endpoints format to the same value, and "from X to X" is a degenerate
+            # comparison that trips our own integrity gate — which aborted delivery
+            # of a real FCP self-regression (Unknown ISP, share 2.1%->2.1%) on
+            # 2026-11-24. The flat share is not the story here (the self-slowdown is),
+            # so state it without a no-op before->after range; number-free in the flat
+            # case keeps it validator-safe. Mirrors the v6.9.14 collapse already used
+            # for the excluded-p75 line.
+            _sn, _sa = fmt_pct(_t["share_normal_pct"]), fmt_pct(_t["share_anomaly_pct"])
+            if _sn == _sa:
+                _share_clause = "while its traffic share stayed essentially flat"
+            else:
+                _tr = "fell" if _t["share_delta_pp"] < 0 else "rose"
+                _share_clause = f"while its traffic share {_tr} from {_sn} to {_sa}"
             facts["segment_concentration"] = (
                 f"The regression is concentrated in the {_lab} {_dw}: its p75 rose from "
-                f"{fmt_ms(_t['p75_normal'])} to {fmt_ms(_t['p75_anomaly'])} while its traffic share {_tr} "
-                f"from {fmt_pct(_t['share_normal_pct'])} to {fmt_pct(_t['share_anomaly_pct'])} — a genuine "
+                f"{fmt_ms(_t['p75_normal'])} to {fmt_ms(_t['p75_anomaly'])} {_share_clause} — a genuine "
                 f"self-slowdown in this segment, not a traffic-mix effect.")
 
     # v6.9.17 (Gap 2): which LAYER the paint-metric rise lives in. Reads the single
@@ -4097,13 +4143,39 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     # covers narrative_facts, section_facts, playbook actions AND hypotheses —
     # v6.5 checked only narrative_facts, so a sentence living solely in
     # section_facts (the localization line) deadlocked every attempt
+    # v6.9.25: a supplied-text wording bug must NOT silently suppress delivery of a
+    # real anomaly. This gate used to raise, so a single degenerate fact sentence
+    # (e.g. a flat-share "from 2.1% to 2.1%" line) aborted the whole run and a
+    # critical FCP report was moved to failed/ and never emailed. Instead, drop the
+    # offending sentences and re-check: if that clears it, run the LLM on the
+    # sanitized facts; if a residual issue remains, ship the deterministic fallback.
+    # Either way a report is always produced and delivered.
+    force_fallback = False
     _bugs = self_check_supplied_text(findings, metric_bindings, allowed_numbers)
     if _bugs:
         print("[PIPELINE BUG] text supplied to the model fails our own gates:")
         for b in _bugs:
             print("   -", b)
-        raise AssertionError("Fix the pipeline (bindings/fact wording) before running the LLM.")
-    print(f"self-check passed: {len(collect_supplied_text(findings))} supplied strings are gate-clean")
+        dropped = drop_failed_supplied_text(findings, _bugs)
+        if dropped:
+            print(f"[recover] dropped {len(dropped)} unsafe supplied sentence(s): {dropped}")
+            # hypotheses may have changed; keep the section contract in step
+            want_hypotheses = bool(findings.get("hypotheses"))
+            required_sections = list(REQUIRED_SECTIONS)
+            if want_hypotheses:
+                required_sections.insert(4, "Hypotheses")
+            findings_text = json.dumps(findings, indent=2, ensure_ascii=False, default=str)
+            prompt = build_llm_prompt_v63(findings_text, findings["section_facts"], want_hypotheses)
+        _bugs = self_check_supplied_text(findings, metric_bindings, allowed_numbers)
+        if _bugs:
+            print("[recover] residual supplied-text issues remain; shipping the deterministic fallback:")
+            for b in _bugs:
+                print("   -", b)
+            force_fallback = True
+        else:
+            print("[recover] sanitized supplied text now passes all gates")
+    else:
+        print(f"self-check passed: {len(collect_supplied_text(findings))} supplied strings are gate-clean")
     playbook_actions = findings.get("remediation_playbook", [])
     focus_segments = [r["segment"] for r in (findings["segments"].get("focus_list") or [])]
     # same descriptive-vocabulary exemptions the self-check uses (segment-label
@@ -4114,6 +4186,8 @@ def run_v6(csv_path, *, sec_dir, processed_dir=None, metadata_path=None,
     report_md, report_source = None, "fallback_template"
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if force_fallback:  # v6.9.25: supplied facts could not be fully sanitized
+            break           # -> skip the LLM and emit the deterministic report below
         try:
             cand = call_llm(prompt)
         except Exception as e:
